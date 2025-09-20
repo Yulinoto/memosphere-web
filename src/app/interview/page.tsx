@@ -3,6 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import localforage from "localforage";
+import LiveSTT from "./LiveSTT";
 
 type Clip = {
   id: string;
@@ -15,23 +16,19 @@ type Clip = {
 export default function InterviewPage() {
   const [micAllowed, setMicAllowed] = useState<boolean | null>(null);
   const [isRecording, setIsRecording] = useState(false);
-  const [duration, setDuration] = useState(0); // secondes
+  const [duration, setDuration] = useState(0);
   const [clips, setClips] = useState<Clip[]>([]);
+  const [transcript, setTranscript] = useState<string>(""); // <— on accumule ici
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  // configure localforage
   useEffect(() => {
-    localforage.config({
-      name: "memosphere",
-      storeName: "audio_clips",
-    });
+    localforage.config({ name: "memosphere", storeName: "audio_clips" });
     loadClipsFromStorage();
   }, []);
 
-  // demande permission micro
   useEffect(() => {
     (async () => {
       try {
@@ -43,45 +40,34 @@ export default function InterviewPage() {
       }
     })();
     return () => {
-      // cleanup
       timerRef.current && window.clearInterval(timerRef.current);
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
   }, []);
 
   const loadClipsFromStorage = async () => {
-    try {
-      const keys = await localforage.keys();
-      const loaded: Clip[] = [];
-      for (const key of keys) {
-        const blob = await localforage.getItem<Blob>(key);
-        if (blob) {
-          const b = blob as Blob;
-          const id = key;
-          loaded.push({
-            id,
-            name: `clip-${new Date(parseInt(id, 10)).toLocaleString()}`,
-            blobUrl: URL.createObjectURL(b),
-            size: b.size,
-            createdAt: parseInt(id, 10),
-          });
-        }
+    const keys = await localforage.keys();
+    const loaded: Clip[] = [];
+    for (const key of keys) {
+      const blob = await localforage.getItem<Blob>(key);
+      if (blob) {
+        loaded.push({
+          id: key,
+          name: `clip-${new Date(parseInt(key, 10)).toLocaleString()}`,
+          blobUrl: URL.createObjectURL(blob),
+          size: (blob as Blob).size,
+          createdAt: parseInt(key, 10),
+        });
       }
-      // trier par date décroissante
-      loaded.sort((a, b) => b.createdAt - a.createdAt);
-      setClips(loaded);
-    } catch (e) {
-      console.error("Erreur chargement clips", e);
     }
+    loaded.sort((a, b) => b.createdAt - a.createdAt);
+    setClips(loaded);
   };
 
   const startTimer = () => {
     setDuration(0);
-    timerRef.current = window.setInterval(() => {
-      setDuration((d) => d + 1);
-    }, 1000);
+    timerRef.current = window.setInterval(() => setDuration((d) => d + 1), 1000);
   };
-
   const stopTimer = () => {
     if (timerRef.current) {
       window.clearInterval(timerRef.current);
@@ -92,12 +78,10 @@ export default function InterviewPage() {
   const startRecording = () => {
     if (!streamRef.current) return;
     chunksRef.current = [];
-    const options: MediaRecorderOptions = { mimeType: "audio/webm" };
     let mr: MediaRecorder;
     try {
-      mr = new MediaRecorder(streamRef.current, options);
+      mr = new MediaRecorder(streamRef.current, { mimeType: "audio/webm" });
     } catch {
-      // fallback sans options
       mr = new MediaRecorder(streamRef.current);
     }
     recorderRef.current = mr;
@@ -130,10 +114,7 @@ export default function InterviewPage() {
     setIsRecording(false);
   };
 
-  const toggleRecording = () => {
-    if (isRecording) stopRecording();
-    else startRecording();
-  };
+  const toggleRecording = () => (isRecording ? stopRecording() : startRecording());
 
   const deleteClip = async (id: string) => {
     await localforage.removeItem(id);
@@ -142,7 +123,6 @@ export default function InterviewPage() {
 
   const clearAll = async () => {
     await localforage.clear();
-    // revoke blob URLs
     clips.forEach((c) => URL.revokeObjectURL(c.blobUrl));
     setClips([]);
   };
@@ -158,6 +138,13 @@ export default function InterviewPage() {
         )}
         {micAllowed === true && <div className="p-3 rounded-lg border bg-green-50">Micro autorisé ✔</div>}
 
+        {/* STT live (beta) */}
+        <LiveSTT
+          lang="fr-FR"
+          onFinal={(chunk) => setTranscript((prev) => (prev ? prev + " " + chunk : chunk))}
+        />
+
+        {/* Boutons d’enregistrement de clips (archives locales) */}
         <div className="flex items-center gap-4">
           <button
             onClick={toggleRecording}
@@ -169,15 +156,20 @@ export default function InterviewPage() {
             {isRecording ? `Enregistrement… ${duration}s (cliquer pour arrêter)` : "Enregistrer un clip"}
           </button>
 
-          <button
-            onClick={clearAll}
-            className="rounded-xl px-4 py-2 border text-sm hover:bg-gray-50"
-            title="Supprime tous les clips locaux"
-          >
+          <button onClick={clearAll} className="rounded-xl px-4 py-2 border text-sm hover:bg-gray-50">
             Supprimer tout
           </button>
         </div>
 
+        {/* Transcription accumulée */}
+        <div className="space-y-2">
+          <div className="text-sm text-muted-foreground">Transcription (finale) — STT navigateur</div>
+          <div className="min-h-24 border rounded-xl p-3 bg-white whitespace-pre-wrap">
+            {transcript || <span className="text-gray-500">— Rien pour l’instant —</span>}
+          </div>
+        </div>
+
+        {/* Liste des clips enregistrés */}
         <div className="space-y-2">
           <div className="text-sm text-muted-foreground">Clips enregistrés (local)</div>
           <div className="space-y-3">
@@ -194,7 +186,6 @@ export default function InterviewPage() {
                 <div className="flex gap-2">
                   <button
                     onClick={() => {
-                      // forcer lecture via JS si besoin
                       const aud = document.querySelector(`audio[src="${c.blobUrl}"]`) as HTMLAudioElement | null;
                       aud?.play();
                     }}
@@ -212,8 +203,8 @@ export default function InterviewPage() {
         </div>
 
         <div className="text-sm text-gray-500">
-          Les clips sont stockés localement (IndexedDB). Tu peux les exporter ou les synchroniser vers le cloud plus
-          tard.
+          Les clips restent en local (IndexedDB). La STT live fonctionne mieux sur Chrome. On ajoutera Whisper côté
+          serveur pour une précision stable multi-navigateurs.
         </div>
       </div>
     </main>
