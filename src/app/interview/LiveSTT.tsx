@@ -3,12 +3,12 @@
 
 import { useEffect, useRef, useState } from "react";
 
-type SpeechRecognitionType =
-  | (typeof window & {
-      webkitSpeechRecognition?: any;
-      SpeechRecognition?: any;
-    })["SpeechRecognition"]
-  | any;
+type SRConstructor = new () => SpeechRecognition;
+
+function getSRConstructor(): SRConstructor | undefined {
+  if (typeof window === "undefined") return undefined;
+  return window.SpeechRecognition ?? window.webkitSpeechRecognition;
+}
 
 export default function LiveSTT({
   lang = "fr-FR",
@@ -20,64 +20,63 @@ export default function LiveSTT({
   const [supported, setSupported] = useState<boolean | null>(null);
   const [listening, setListening] = useState(false);
   const [partial, setPartial] = useState("");
-  const recognitionRef = useRef<SpeechRecognitionType | null>(null);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
 
   useEffect(() => {
-    const SR =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    const SR = getSRConstructor();
     if (!SR) {
       setSupported(false);
       return;
     }
     setSupported(true);
+
     const rec = new SR();
     rec.lang = lang;
     rec.continuous = true;
     rec.interimResults = true;
 
-    rec.onresult = (e: any) => {
+    rec.onresult = (e: SpeechRecognitionEvent) => {
       let interim = "";
       let finalChunk = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
-        const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) {
-          finalChunk += t + " ";
-        } else {
-          interim += t;
-        }
+        const res = e.results[i];
+        const alt = res[0];
+        if (res.isFinal) finalChunk += alt.transcript + " ";
+        else interim += alt.transcript;
       }
       setPartial(interim);
-      if (finalChunk.trim()) {
-        onFinal?.(finalChunk.trim());
-      }
+      if (finalChunk.trim()) onFinal?.(finalChunk.trim());
     };
 
-    rec.onend = () => {
-      setListening(false);
-    };
+    rec.onend = () => setListening(false);
 
     recognitionRef.current = rec;
+
     return () => {
       try {
         rec.stop();
-      } catch {}
+      } catch {
+        /* noop */
+      }
     };
   }, [lang, onFinal]);
 
   const start = () => {
-    if (!recognitionRef.current) return;
+    const rec = recognitionRef.current;
+    if (!rec) return;
     try {
-      recognitionRef.current.start();
+      rec.start();
       setListening(true);
-    } catch {}
+    } catch {/* noop */}
   };
 
   const stop = () => {
-    if (!recognitionRef.current) return;
+    const rec = recognitionRef.current;
+    if (!rec) return;
     try {
-      recognitionRef.current.stop();
+      rec.stop();
       setListening(false);
-    } catch {}
+    } catch {/* noop */}
   };
 
   if (supported === null) {
@@ -86,8 +85,8 @@ export default function LiveSTT({
   if (supported === false) {
     return (
       <div className="p-3 rounded-lg border bg-yellow-50">
-        La transcription vocale en direct n’est pas supportée par ce navigateur.
-        Utilise Chrome/Edge pour ce mode. (On ajoutera Whisper côté serveur ensuite.)
+        La transcription en direct n’est pas supportée par ce navigateur.
+        Utilise Chrome/Edge. (On ajoutera Whisper côté serveur ensuite.)
       </div>
     );
   }
@@ -103,9 +102,7 @@ export default function LiveSTT({
         >
           {listening ? "STT ON — Arrêter" : "Transcrire en direct (beta)"}
         </button>
-        {listening && (
-          <span className="text-sm text-green-700">Écoute en cours…</span>
-        )}
+        {listening && <span className="text-sm text-green-700">Écoute en cours…</span>}
       </div>
       <div className="min-h-12 text-sm text-gray-700 italic">
         {partial ? `• ${partial}` : "— (texte provisoire en direct) —"}

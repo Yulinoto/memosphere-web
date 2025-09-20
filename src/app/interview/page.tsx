@@ -18,7 +18,7 @@ export default function InterviewPage() {
   const [isRecording, setIsRecording] = useState(false);
   const [duration, setDuration] = useState(0);
   const [clips, setClips] = useState<Clip[]>([]);
-  const [transcript, setTranscript] = useState<string>(""); // <— on accumule ici
+  const [transcript, setTranscript] = useState<string>(""); // transcription live
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
@@ -40,7 +40,9 @@ export default function InterviewPage() {
       }
     })();
     return () => {
-      timerRef.current && window.clearInterval(timerRef.current);
+      if (timerRef.current) {
+        window.clearInterval(timerRef.current);
+      }
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
   }, []);
