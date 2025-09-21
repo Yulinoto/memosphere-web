@@ -1,4 +1,3 @@
-// src/app/interview/DeepgramSTT.tsx
 "use client";
 
 import { useState } from "react";
@@ -8,33 +7,36 @@ type Props = {
   onPartial?: (t: string) => void;
   onFinal?: (t: string) => void;
   setStatus?: (s: string) => void;
+  onFatal?: (reason: string) => void; // ← NOUVEAU: pour auto-fallback
 };
 
-export default function DeepgramSTT({ onPartial, onFinal, setStatus }: Props) {
+export default function DeepgramSTT({ onPartial, onFinal, setStatus, onFatal }: Props) {
   const [listening, setListening] = useState(false);
 
   async function start() {
     setStatus?.("Connexion à Deepgram…");
 
-    // 1) Récupérer un token éphémère
-    const res = await fetch("/api/dg-token");
-    const json = await res.json();
-
-    if (!res.ok) {
-      console.log("Token error payload:", json);
-      setStatus?.(`Erreur token (${json?.status || res.status})`);
-      return;
-    }
-    if (!json?.access_token) {
-      console.log("Token missing access_token:", json);
-      setStatus?.("Token invalide (pas d'access_token)");
+    let token: string | undefined;
+    try {
+      const res = await fetch("/api/dg-token");
+      const json = await res.json();
+      if (!res.ok || !json?.access_token) throw new Error("Token invalide");
+      token = json.access_token;
+    } catch (e: any) {
+      setStatus?.("Erreur token Deepgram");
+      onFatal?.("token");            // ← déclenche le fallback
       return;
     }
 
-    // 2) Créer le client avec l’ACCESS TOKEN (important : pas apiKey ici)
-    const dg = createClient({ accessToken: json.access_token });
+    let dg: any;
+    try {
+      dg = createClient({ accessToken: token });
+    } catch {
+      setStatus?.("Erreur client Deepgram");
+      onFatal?.("client");
+      return;
+    }
 
-    // 3) Ouvrir la connexion live
     const conn = dg.listen.live({
       model: "nova-3",
       language: "fr",
@@ -47,22 +49,28 @@ export default function DeepgramSTT({ onPartial, onFinal, setStatus }: Props) {
       setStatus?.("Deepgram connecté ✅");
       setListening(true);
 
-      // Micro → MediaRecorder (webm/opus)
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "audio/webm";
-      const rec = new MediaRecorder(stream, { mimeType: mime });
+      let stream: MediaStream | undefined;
+      let rec: MediaRecorder | undefined;
 
-      rec.ondataavailable = (e) => {
-        if (e.data.size > 0 && conn.getReadyState() === WebSocket.OPEN) {
-          conn.send(e.data);
-        }
-      };
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus"
+          : "audio/webm";
+        rec = new MediaRecorder(stream, { mimeType: mime });
+        rec.ondataavailable = (e) => {
+          if (e.data.size > 0 && conn.getReadyState() === WebSocket.OPEN) {
+            conn.send(e.data);
+          }
+        };
+        rec.start(250);
+      } catch {
+        setStatus?.("Accès micro refusé / non dispo");
+        onFatal?.("mic");
+        try { conn.close(); } catch {}
+        return;
+      }
 
-      rec.start(250); // ~4 paquets/s
-
-      // Transcripts
       conn.on(LiveTranscriptionEvents.Transcript, (data: any) => {
         const alt = data?.channel?.alternatives?.[0];
         const text = alt?.transcript || "";
@@ -71,18 +79,31 @@ export default function DeepgramSTT({ onPartial, onFinal, setStatus }: Props) {
         else onPartial?.(text);
       });
 
-      conn.on(LiveTranscriptionEvents.Error, (e) => {
-        console.log("DG error:", e);
+      const cleanup = () => {
+        setListening(false);
+        try { rec && rec.state !== "inactive" && rec.stop(); } catch {}
+        try { stream && stream.getTracks().forEach((t) => t.stop()); } catch {}
+      };
+
+      conn.on(LiveTranscriptionEvents.Error, () => {
         setStatus?.("Erreur Deepgram");
+        cleanup();
+        onFatal?.("ws");
       });
 
       conn.on(LiveTranscriptionEvents.Close, () => {
         setStatus?.("Connexion fermée");
-        setListening(false);
-        try { rec.state !== "inactive" && rec.stop(); } catch {}
-        stream.getTracks().forEach((t) => t.stop());
+        cleanup();
       });
     });
+
+    // si la socket foire avant "Open"
+    setTimeout(() => {
+      if (!listening && typeof onFatal === "function") {
+        // socket qui n'ouvre jamais → fallback
+        onFatal("timeout");
+      }
+    }, 6000);
   }
 
   return (
