@@ -1,4 +1,3 @@
-// src/app/interview/LiveSTT.tsx
 "use client";
 
 import { useEffect, useRef, useState } from "react";
@@ -17,7 +16,6 @@ type SpeechRecognitionLike = {
 
 function getSRConstructor(): SRConstructor | undefined {
   if (typeof window === "undefined") return undefined;
-  // Chrome/Edge: webkitSpeechRecognition; Firefox: pas supporté
   const ctor =
     (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
   return ctor ? (ctor as SRConstructor) : undefined;
@@ -28,6 +26,9 @@ type Props = {
   onPartial?: (t: string) => void;    // texte provisoire (interim)
   onFinal?: (t: string) => void;      // texte validé (final)
   setStatus?: (s: string) => void;    // petit statut UI
+  onStart?: () => void;               // pour bips + vumètre
+  onStop?: () => void;                // pour bips + vumètre
+  buttonLabel?: string;               // libellé personnalisable
 };
 
 export default function LiveSTT({
@@ -35,6 +36,9 @@ export default function LiveSTT({
   onPartial,
   onFinal,
   setStatus,
+  onStart,
+  onStop,
+  buttonLabel = "Voix (navigateur)",
 }: Props) {
   const [supported, setSupported] = useState<boolean | null>(null);
   const [listening, setListening] = useState(false);
@@ -56,7 +60,6 @@ export default function LiveSTT({
     rec.interimResults = true;
 
     rec.onresult = (e: any) => {
-      // Agrège l'interim et collecte les finals
       let interim = "";
       let finalChunk = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -74,14 +77,13 @@ export default function LiveSTT({
     rec.onend = () => {
       setListening(false);
       setStatus?.("STT arrêté.");
+      onStop?.();
     };
 
     recRef.current = rec;
 
     return () => {
-      try {
-        rec.stop();
-      } catch {/* noop */}
+      try { rec.stop(); } catch {/* noop */}
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lang]);
@@ -93,6 +95,7 @@ export default function LiveSTT({
       rec.start();
       setListening(true);
       setStatus?.("STT navigateur en cours…");
+      onStart?.();
     } catch {/* noop */}
   };
 
@@ -103,6 +106,7 @@ export default function LiveSTT({
       rec.stop();
       setListening(false);
       setStatus?.("STT arrêté.");
+      onStop?.();
     } catch {/* noop */}
   };
 
@@ -125,7 +129,7 @@ export default function LiveSTT({
           onClick={listening ? stop : start}
           className={`rounded-xl px-4 py-2 border ${listening ? "bg-green-100" : "hover:bg-gray-50"}`}
         >
-          {listening ? "STT ON — Arrêter" : "Transcrire en direct (navigateur)"}
+          {listening ? `${buttonLabel} — Arrêter` : `${buttonLabel} — Démarrer`}
         </button>
         {listening && <span className="text-sm text-green-700">Écoute en cours…</span>}
       </div>

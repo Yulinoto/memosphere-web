@@ -7,10 +7,21 @@ type Props = {
   onPartial?: (t: string) => void;
   onFinal?: (t: string) => void;
   setStatus?: (s: string) => void;
-  onFatal?: (reason: string) => void; // ← NOUVEAU: pour auto-fallback
+  onFatal?: (reason: string) => void; // fallback auto
+  onStart?: () => void;               // bips + vumètre
+  onStop?: () => void;                // bips + vumètre
+  buttonLabel?: string;               // libellé bouton
 };
 
-export default function DeepgramSTT({ onPartial, onFinal, setStatus, onFatal }: Props) {
+export default function DeepgramSTT({
+  onPartial,
+  onFinal,
+  setStatus,
+  onFatal,
+  onStart,
+  onStop,
+  buttonLabel = "Voix pro (Deepgram)",
+}: Props) {
   const [listening, setListening] = useState(false);
 
   async function start() {
@@ -24,7 +35,7 @@ export default function DeepgramSTT({ onPartial, onFinal, setStatus, onFatal }: 
       token = json.access_token;
     } catch (e: any) {
       setStatus?.("Erreur token Deepgram");
-      onFatal?.("token");            // ← déclenche le fallback
+      onFatal?.("token");
       return;
     }
 
@@ -64,10 +75,12 @@ export default function DeepgramSTT({ onPartial, onFinal, setStatus, onFatal }: 
           }
         };
         rec.start(250);
+        onStart?.(); // démarre gadgets parent
       } catch {
         setStatus?.("Accès micro refusé / non dispo");
         onFatal?.("mic");
         try { conn.close(); } catch {}
+        onStop?.();
         return;
       }
 
@@ -83,6 +96,7 @@ export default function DeepgramSTT({ onPartial, onFinal, setStatus, onFatal }: 
         setListening(false);
         try { rec && rec.state !== "inactive" && rec.stop(); } catch {}
         try { stream && stream.getTracks().forEach((t) => t.stop()); } catch {}
+        onStop?.(); // stop gadgets parent
       };
 
       conn.on(LiveTranscriptionEvents.Error, () => {
@@ -97,12 +111,9 @@ export default function DeepgramSTT({ onPartial, onFinal, setStatus, onFatal }: 
       });
     });
 
-    // si la socket foire avant "Open"
+    // timeout si la socket n’ouvre pas
     setTimeout(() => {
-      if (!listening && typeof onFatal === "function") {
-        // socket qui n'ouvre jamais → fallback
-        onFatal("timeout");
-      }
+      if (!listening && typeof onFatal === "function") onFatal("timeout");
     }, 6000);
   }
 
@@ -112,7 +123,7 @@ export default function DeepgramSTT({ onPartial, onFinal, setStatus, onFatal }: 
       disabled={listening}
       className="px-4 py-2 rounded border bg-indigo-50 hover:bg-indigo-100"
     >
-      {listening ? "Deepgram ON 🎤" : "Activer transcription pro"}
+      {listening ? `${buttonLabel} — ON` : `${buttonLabel} — Démarrer`}
     </button>
   );
 }
