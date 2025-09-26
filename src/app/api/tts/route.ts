@@ -1,8 +1,7 @@
-// src/app/api/tts/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 
-export const runtime = "nodejs"; // on reste côté Node
+export const runtime = "nodejs"; // forcer Node (le SDK audio l'attend)
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || "",
@@ -26,7 +25,7 @@ export async function POST(req: NextRequest) {
       model: "gpt-4o-mini-tts",
       input: text,
       voice: typeof voice === "string" && voice ? voice : "alloy",
-      response_format: "mp3", // <-- la bonne clé
+      response_format: "mp3",
     });
 
     const buf = Buffer.from(await speech.arrayBuffer());

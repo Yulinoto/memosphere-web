@@ -2,141 +2,191 @@
 
 import { useEffect, useRef, useState } from "react";
 
-/** Types minimaux pour éviter les prises de tête TS strictes */
-type SRConstructor = new () => SpeechRecognitionLike;
-type SpeechRecognitionLike = {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  start: () => void;
-  stop: () => void;
-  onresult: ((ev: any) => void) | null;
-  onend: (() => void) | null;
-};
-
-function getSRConstructor(): SRConstructor | undefined {
-  if (typeof window === "undefined") return undefined;
-  const ctor =
-    (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-  return ctor ? (ctor as SRConstructor) : undefined;
-}
-
 type Props = {
-  lang?: string;                      // par défaut "fr-FR"
-  onPartial?: (t: string) => void;    // texte provisoire (interim)
-  onFinal?: (t: string) => void;      // texte validé (final)
-  setStatus?: (s: string) => void;    // petit statut UI
-  onStart?: () => void;               // pour bips + vumètre
-  onStop?: () => void;                // pour bips + vumètre
-  buttonLabel?: string;               // libellé personnalisable
+  onPartial: (text: string) => void;
+  onFinal: (text: string) => void;
+  setStatus: (s: string) => void;
+  onStart?: () => void;
+  onStop?: () => void;
+  buttonLabel?: string;
+
+  /** Mains libres: reconnexion auto, pas besoin de recliquer */
+  auto?: boolean;
+  /** Langue (par défaut fr-FR) */
+  lang?: string;
+  /** Relance après fin (ms) en auto */
+  autoRestartDelayMs?: number;
 };
+
+type WebkitSpeechRecognition = typeof window extends any
+  ? any
+  : never;
 
 export default function LiveSTT({
-  lang = "fr-FR",
   onPartial,
   onFinal,
   setStatus,
   onStart,
   onStop,
   buttonLabel = "Voix (navigateur)",
+  auto = false,
+  lang = "fr-FR",
+  autoRestartDelayMs = 250
 }: Props) {
-  const [supported, setSupported] = useState<boolean | null>(null);
-  const [listening, setListening] = useState(false);
-  const [partial, setPartial] = useState("");
-  const recRef = useRef<SpeechRecognitionLike | null>(null);
+  const recRef = useRef<WebkitSpeechRecognition | null>(null);
+  const [supported, setSupported] = useState(false);
+  const [recognizing, setRecognizing] = useState(false);
+  const [permissionAsked, setPermissionAsked] = useState(false); // pour la 1re activation
 
+  // Init / feature detection
   useEffect(() => {
-    const SR = getSRConstructor();
-    if (!SR) {
+    const W = window as any;
+    if ("webkitSpeechRecognition" in W) {
+      setSupported(true);
+    } else {
       setSupported(false);
-      setStatus?.("STT navigateur non supporté (essaie Chrome/Edge).");
-      return;
+      setStatus("Reconnaissance vocale non supportée (essayez Chrome/Edge).");
     }
-    setSupported(true);
+  }, [setStatus]);
 
-    const rec = new SR();
-    rec.lang = lang;
-    rec.continuous = true;
-    rec.interimResults = true;
-
-    rec.onresult = (e: any) => {
-      let interim = "";
-      let finalChunk = "";
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const res = e.results[i];
-        const alt = res[0];
-        if (res.isFinal) finalChunk += alt.transcript + " ";
-        else interim += alt.transcript;
-      }
-      setPartial(interim);
-      onPartial?.(interim);
-      const finalTrim = finalChunk.trim();
-      if (finalTrim) onFinal?.(finalTrim);
-    };
-
-    rec.onend = () => {
-      setListening(false);
-      setStatus?.("STT arrêté.");
-      onStop?.();
-    };
-
-    recRef.current = rec;
-
-    return () => {
-      try { rec.stop(); } catch {/* noop */}
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lang]);
-
-  const start = () => {
-    const rec = recRef.current;
-    if (!rec) return;
-    try {
-      rec.start();
-      setListening(true);
-      setStatus?.("STT navigateur en cours…");
+  const attachHandlers = (rec: any) => {
+    rec.onstart = () => {
+      setRecognizing(true);
+      setStatus("J’écoute…");
       onStart?.();
-    } catch {/* noop */}
+    };
+    rec.onerror = (evt: any) => {
+      const err = evt?.error;
+      // Quelques erreurs fréquentes : "no-speech", "audio-capture", "not-allowed"
+      if (err === "not-allowed" || err === "service-not-allowed") {
+        setStatus("Permission micro refusée.");
+      } else if (err === "no-speech") {
+        setStatus("Pas de voix détectée.");
+      } else {
+        setStatus(`Erreur STT: ${err || "inconnue"}`);
+      }
+    };
+    rec.onend = () => {
+      setRecognizing(false);
+      onStop?.();
+      if (auto) {
+        // Relance douce
+        setTimeout(() => {
+          tryStart();
+        }, autoRestartDelayMs);
+      } else {
+        setStatus("Prêt.");
+      }
+    };
+    rec.onresult = (evt: any) => {
+      let interim = "";
+      let finalText = "";
+
+      for (let i = evt.resultIndex; i < evt.results.length; i++) {
+        const res = evt.results[i];
+        if (res.isFinal) {
+          finalText += res[0].transcript;
+        } else {
+          interim += res[0].transcript;
+        }
+      }
+
+      // Affichage du partiel
+      onPartial(interim.trim());
+
+      // À chaque finale, on pousse
+      if (finalText.trim()) {
+        onFinal(finalText.trim());
+        onPartial(""); // nettoie l'interim
+        // En mode auto + continuous, le moteur reste ouvert
+        // On laisse tourner (le onend relancera si besoin)
+      }
+    };
+  };
+
+  const createRecognizer = () => {
+    const W = window as any;
+    const rec = new W.webkitSpeechRecognition();
+    rec.continuous = true;         // écoute continue
+    rec.interimResults = true;     // résultats partiels "en direct"
+    rec.lang = lang;
+    attachHandlers(rec);
+    recRef.current = rec;
+    return rec;
+  };
+
+  const tryStart = async () => {
+    if (!supported) return;
+    // Si un ancien instance existe, on s’assure qu’elle est stoppée
+    try {
+      recRef.current?.stop();
+    } catch {}
+
+    const rec = recRef.current ?? createRecognizer();
+
+    try {
+      rec.start(); // peut throw si pas d'interaction préalable
+      setPermissionAsked(true);
+    } catch (e: any) {
+      // Autoplay/permissions: il faut un clic utilisateur initial
+      // On laisse un statut explicite pour guider l’utilisateur
+      if (e?.message?.includes("start")) {
+        setStatus("Clique sur le bouton pour activer le micro.");
+      } else {
+        setStatus("Impossible de démarrer la reconnaissance (autorisation ?).");
+      }
+    }
   };
 
   const stop = () => {
-    const rec = recRef.current;
-    if (!rec) return;
     try {
-      rec.stop();
-      setListening(false);
-      setStatus?.("STT arrêté.");
-      onStop?.();
-    } catch {/* noop */}
+      recRef.current?.stop();
+    } catch {}
   };
 
-  if (supported === null) {
-    return <div className="p-3 rounded-lg border">Initialisation STT…</div>;
-  }
-  if (supported === false) {
-    return (
-      <div className="p-3 rounded-lg border bg-yellow-50">
-        La transcription en direct n’est pas supportée par ce navigateur.
-        Utilise Chrome/Edge, ou active Deepgram dans le switch.
-      </div>
-    );
-  }
+  // Effet: mode auto => démarrer si possible
+  useEffect(() => {
+    if (!auto) return;
+    // Si l’utilisateur n’a jamais autorisé le micro, il faudra un clic.
+    if (!permissionAsked) return;
+    if (!recognizing) {
+      tryStart();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auto]);
+
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      try {
+        recRef.current?.stop();
+      } catch {}
+      recRef.current = null;
+    };
+  }, []);
 
   return (
-    <div className="space-y-2">
-      <div className="flex items-center gap-2">
-        <button
-          onClick={listening ? stop : start}
-          className={`rounded-xl px-4 py-2 border ${listening ? "bg-green-100" : "hover:bg-gray-50"}`}
-        >
-          {listening ? `${buttonLabel} — Arrêter` : `${buttonLabel} — Démarrer`}
-        </button>
-        {listening && <span className="text-sm text-green-700">Écoute en cours…</span>}
-      </div>
+    <div className="flex items-center gap-2">
+      <button
+        className={`px-3 py-2 border rounded text-sm ${recognizing ? "bg-red-50" : "hover:bg-gray-50"}`}
+        onClick={() => {
+          if (!supported) return;
+          if (recognizing) {
+            stop();
+          } else {
+            tryStart();
+          }
+        }}
+        title={recognizing ? "Arrêter" : "Activer le micro"}
+      >
+        {recognizing ? "■ Stop" : `🎙️ ${buttonLabel}`}
+      </button>
 
-      <div className="min-h-12 text-sm text-gray-700 italic">
-        {partial ? `• ${partial}` : "— (texte provisoire en direct) —"}
-      </div>
+      {auto ? (
+        <span className="text-xs text-gray-600">Mains libres activé</span>
+      ) : (
+        <span className="text-xs text-gray-500">Cliquer pour parler</span>
+      )}
     </div>
   );
 }
