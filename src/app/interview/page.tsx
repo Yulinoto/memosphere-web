@@ -1,13 +1,14 @@
+// src/app/interview/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useBlocks } from "@/hooks/useBlocks";
 import type { Entry } from "@/data/blocks";
-import { useBetterTTS } from "@/hooks/useBetterTTS";
 import DeepgramSTT from "./DeepgramSTT";
 import LiveSTT from "./LiveSTT";
-
+import schemaJson from "@/data/interviewSchema.json";
+import { useBetterTTS } from "@/hooks/useBetterTTS";
 
 type Mode = "voice" | "text";
 type MsgRole = "assistant" | "user" | "draft";
@@ -21,9 +22,9 @@ type PendingPayload = {
 
 export default function InterviewPage() {
   const router = useRouter();
-  const { loading, blocks, appendNarrative } = useBlocks();
+  const { loading, blocks, addTextEntry } = useBlocks();
 
-  // ===== Sélecteur bloc (mode libre) =====
+  // ===== Liste blocs / sélection (mode libre) =====
   const items = useMemo(() => (blocks ? Object.values(blocks) : []), [blocks]);
   const [selectedId, setSelectedId] = useState<string>("");
 
@@ -39,17 +40,28 @@ export default function InterviewPage() {
     "lieux",
     "heritage",
   ] as const;
+
   const [guided, setGuided] = useState(false);
   const [scriptOrder, setScriptOrder] = useState<string[]>(
     DEFAULT_ORDER.filter((id) => !!blocks?.[id])
   );
-  const [gIndex, setGIndex] = useState(0);
-  const [qIndex, setQIndex] = useState(0);
+  const [gIndex, setGIndex] = useState(0); // bloc
+  const [qIndex, setQIndex] = useState(0); // question index dans le bloc
 
-  // ===== Bloc actif =====
+  // Pré-sélection premier bloc en mode libre
+  useEffect(() => {
+    if (!loading && items.length && !selectedId && !guided) {
+      setSelectedId(items[0].id);
+    }
+  }, [loading, items, selectedId, guided]);
+
+  // Bloc actif selon mode
   const guidedBlockId = guided ? scriptOrder[gIndex] : null;
   const activeBlock = useMemo(() => {
-    if (guided) return guidedBlockId ? blocks?.[guidedBlockId] ?? null : null;
+    if (guided) {
+      if (!guidedBlockId) return null;
+      return blocks?.[guidedBlockId] ?? null;
+    }
     if (!selectedId || !blocks) return null;
     return blocks[selectedId] ?? null;
   }, [guided, guidedBlockId, selectedId, blocks]);
@@ -57,26 +69,30 @@ export default function InterviewPage() {
   // ===== Mode (Voix / Texte) =====
   const [mode, setMode] = useState<Mode>("voice");
 
-  // ===== TTS (OpenAI) =====
-  const [voice, setVoice] = useState("alloy");
-  const { speak: betterSpeak, stop: stopTTS } = useBetterTTS(voice);
+  // ===== TTS (OpenAI via /api/tts + sélection de voix) =====
   const [ttsOn, setTtsOn] = useState(true);
+  const [ttsVoice, setTtsVoice] = useState<string>(() => {
+    if (typeof window === "undefined") return "alloy";
+    return localStorage.getItem("tts_voice") || "alloy";
+  });
+  const { speak: speakTTS, stop: stopTTS, loading: ttsLoading } = useBetterTTS("alloy");
 
   useEffect(() => {
     const v = localStorage.getItem("tts_on");
     if (v === "0") setTtsOn(false);
-    const storedVoice = localStorage.getItem("tts_voice");
-    if (storedVoice) setVoice(storedVoice);
   }, []);
   useEffect(() => {
     localStorage.setItem("tts_on", ttsOn ? "1" : "0");
     if (!ttsOn) stopTTS();
   }, [ttsOn, stopTTS]);
-  useEffect(() => {
-    localStorage.setItem("tts_voice", voice);
-  }, [voice]);
 
-  // ===== STT moteur =====
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("tts_voice", ttsVoice);
+    }
+  }, [ttsVoice]);
+
+  // ===== STT (choix Deepgram pro / navigateur) =====
   const [usePro, setUsePro] = useState(true);
   useEffect(() => {
     const saved = localStorage.getItem("stt_mode");
@@ -86,17 +102,7 @@ export default function InterviewPage() {
     localStorage.setItem("stt_mode", usePro ? "pro" : "browser");
   }, [usePro]);
 
-  // ===== STT mains libres (navigateur) =====
-  const [autoSTT, setAutoSTT] = useState(false);
-  useEffect(() => {
-    const v = localStorage.getItem("auto_stt");
-    if (v === "1") setAutoSTT(true);
-  }, []);
-  useEffect(() => {
-    localStorage.setItem("auto_stt", autoSTT ? "1" : "0");
-  }, [autoSTT]);
-
-  // ===== Opt-in correction IA =====
+  // ===== Correction IA (reformulation) =====
   const [aiOptIn, setAiOptIn] = useState(true);
   useEffect(() => {
     const v = localStorage.getItem("ai_optin");
@@ -106,78 +112,26 @@ export default function InterviewPage() {
     localStorage.setItem("ai_optin", aiOptIn ? "1" : "0");
   }, [aiOptIn]);
 
-  // ===== Index par bloc (mode libre) =====
-  const [freeQIndexByBlock, setFreeQIndexByBlock] = useState<Record<string, number>>({});
-  useEffect(() => {
-    if (!guided && selectedId) {
-      setFreeQIndexByBlock((prev) => (prev[selectedId] ??= 0, { ...prev }));
-    }
-  }, [guided, selectedId]);
-
-  // ===== Helpers bloc/question =====
+  // ===== blockId fiable =====
   function getActiveBlockId(): string {
-    if (guided) return guidedBlockId ?? scriptOrder[gIndex] ?? "";
+    if (guided) {
+      const id = guidedBlockId ?? scriptOrder[gIndex];
+      return id || "";
+    }
     return selectedId || "";
   }
-
-  // pré-sélection du 1er bloc si rien en session
-  useEffect(() => {
-    if (!loading && !guided && !selectedId && items.length) {
-      setSelectedId(items[0].id);
-    }
-  }, [loading, guided, selectedId, items]);
-
   const blkIdReady = Boolean(activeBlock && getActiveBlockId());
 
+  // ===== Fallback question (pinned) =====
   const nextQuestion = useMemo(() => {
     const p = activeBlock?.pinnedQuestions ?? [];
     if (!p.length) return "Raconte-moi un souvenir lié à ce thème.";
-    if (guided) return p[qIndex % p.length];
-    const blkId = getActiveBlockId();
-    const freeIdx = freeQIndexByBlock[blkId] ?? 0;
-    return p[freeIdx % p.length];
+    const idx = guided ? (qIndex % p.length) : ((activeBlock?.entries.length ?? 0) % p.length);
+    return p[idx];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    activeBlock?.id,
-    activeBlock?.pinnedQuestions?.length,
-    guided,
-    qIndex,
-    selectedId,
-    freeQIndexByBlock,
-  ]);
+  }, [activeBlock?.id, guided, qIndex, activeBlock?.entries.length]);
 
-  // ===== Mémoire session =====
-  useEffect(() => {
-    if (loading || !blocks) return;
-    const raw = localStorage.getItem("ms_session");
-    if (!raw) return;
-
-    try {
-      const s = JSON.parse(raw);
-      const validSelected = s?.selectedId && blocks[s.selectedId] ? s.selectedId : "";
-      const validGuided = !!s?.guided;
-
-      setMode(s?.mode === "text" ? "text" : "voice");
-      setGuided(validGuided);
-
-      if (validGuided) {
-        const order = DEFAULT_ORDER.filter((id) => !!blocks[id]);
-        setScriptOrder(order);
-        setGIndex(Math.max(0, Math.min(Number(s?.gIndex ?? 0), order.length - 1)));
-        setQIndex(Math.max(0, Number(s?.qIndex ?? 0)));
-        setSelectedId("");
-      } else {
-        setSelectedId(validSelected || Object.values(blocks)[0]?.id || "");
-      }
-    } catch {}
-  }, [loading, blocks]);
-
-  useEffect(() => {
-    const snapshot = { mode, guided, selectedId, gIndex, qIndex, ts: Date.now() };
-    localStorage.setItem("ms_session", JSON.stringify(snapshot));
-  }, [mode, guided, selectedId, gIndex, qIndex]);
-
-  // ===== Refs =====
+  // ===== Refs pour éviter closures périmées =====
   const blocksRef = useRef(blocks);
   const questionRef = useRef(nextQuestion);
   const blockIdRef = useRef<string>(getActiveBlockId());
@@ -193,63 +147,75 @@ export default function InterviewPage() {
   // ===== Fil de conversation =====
   const [messages, setMessages] = useState<Message[]>([]);
 
-  // ---- Injection questions ----
-  const readyForQuestion = Boolean(activeBlock && nextQuestion);
-  const lastQuestionRef = useRef<string>("");
+  // ===== IA Questions naturelles =====
+  const [aiQ, setAiQ] = useState<string>("");
+  const [aiEnabled, setAiEnabled] = useState(true);
+  const firstIAAskedRef = useRef(false);
 
-  // 1) MODE GUIDÉ : injecte pinned question à chaque changement
+  async function fetchNextQuestionFor(blockId: string, lastAnswer?: string) {
+    if (!aiEnabled || !blockId) return "";
+    try {
+      const schema: any = (schemaJson as any)[blockId];
+      if (!schema) return "";
+      const res = await fetch("/api/llm/nextQuestion", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          blockId,
+          lastAnswer: lastAnswer || "",
+        }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && json?.ok && typeof json.question === "string") {
+        return String(json.question).trim();
+      }
+      return "";
+    } catch {
+      return "";
+    }
+  }
+
+  // Reset du fil quand on change de bloc actif
   useEffect(() => {
-    if (!readyForQuestion || !guided) return;
-
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (last?.role === "assistant" && last.text === nextQuestion) return prev;
-      return [...prev, { role: "assistant", text: nextQuestion, ts: Date.now() }];
-    });
-    if (ttsOn) betterSpeak(nextQuestion);
-    lastQuestionRef.current = nextQuestion;
+    firstIAAskedRef.current = false;
+    setAiQ("");
+    setMessages([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [readyForQuestion, guided, activeBlock?.id, nextQuestion, ttsOn, betterSpeak]);
+  }, [activeBlock?.id]);
 
-  // 2) MODE LIBRE : seed 1re question GPT
+  // Première question IA à l'arrivée sur un bloc
   useEffect(() => {
-    if (!readyForQuestion || guided) return;
-    if (messages.some((m) => m.role === "assistant")) return;
+    if (!activeBlock) return;
+    if (!aiEnabled) return;
+    if (firstIAAskedRef.current) return;
 
     (async () => {
-      try {
-        const blkId = getActiveBlockId();
-        const res = await fetch("/api/llm/nextQuestion", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ blockId: blkId, lastAnswer: "" }),
-        });
-        let q = nextQuestion;
-        if (res.ok) {
-          const ct = res.headers.get("content-type") || "";
-          const json = ct.includes("application/json") ? await res.json() : {};
-          q = json?.question || nextQuestion;
-        }
-        setMessages((prev) => [...prev, { role: "assistant", text: q, ts: Date.now() }]);
-        if (ttsOn) betterSpeak(q);
-        lastQuestionRef.current = q;
-      } catch (e) {
-        console.error("seed nextQuestion error:", e);
-        const q = nextQuestion;
-        setMessages((prev) => [...prev, { role: "assistant", text: q, ts: Date.now() }]);
-        if (ttsOn) betterSpeak(q);
-        lastQuestionRef.current = q;
+      const blk = getActiveBlockId();
+      if (!blk) return;
+
+      const lastAnswer = (activeBlock.entries?.slice(-1)[0] as any)?.a || "";
+      const q = await fetchNextQuestionFor(blk, lastAnswer);
+      const finalQ = q || nextQuestion;
+      setAiQ(finalQ);
+
+      setMessages((prev) => [...prev, { role: "assistant", text: finalQ, ts: Date.now() }]);
+      if (ttsOn) {
+        try { await speakTTS(finalQ, ttsVoice); } catch {}
       }
+      firstIAAskedRef.current = true;
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [readyForQuestion, guided, selectedId, activeBlock?.id]);
+  }, [activeBlock?.id, aiEnabled, ttsOn, ttsVoice]);
 
-  // ===== Correction IA =====
+  // ===== Correction (reformulation) =====
   async function reformulate(text: string, blockId?: string) {
     const clean = text.trim();
     if (!clean) return "";
     if (!aiOptIn) return clean;
     if (clean.replace(/\s+/g, " ").length < 10) return clean;
+
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), 2500);
     try {
       const res = await fetch("/api/llm/rephrase", {
         method: "POST",
@@ -262,31 +228,34 @@ export default function InterviewPage() {
           style: "journal",
           removeFillers: true,
         }),
+        signal: controller.signal,
       });
-      if (!res.ok) return clean;
-      const ct = res.headers.get("content-type") || "";
-      const json = ct.includes("application/json") ? await res.json() : {};
-      if (json?.ok && typeof json.text === "string") {
-        return String(json.text).trim() || clean;
+      clearTimeout(to);
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && json?.ok && typeof json.text === "string") {
+        const out = String(json.text).trim();
+        return out || clean;
       }
       return clean;
     } catch {
+      clearTimeout(to);
       return clean;
     }
   }
 
-  // ===== Transcription =====
+  // ===== Transcription panneau =====
   const [livePartial, setLivePartial] = useState("");
   const [lastFinalRaw, setLastFinalRaw] = useState("");
   const [lastSavedText, setLastSavedText] = useState("");
 
+  // ===== Contexte STT capturé au start =====
   const sttCtxRef = useRef<{ blockId?: string; question?: string } | null>(null);
-  const [pendingAnswer, setPendingAnswer] = useState<PendingPayload | null>(null);
 
-  // Si finale avant que le bloc soit prêt → rejoue
+  // ===== File d’attente si finale avant bloc prêt =====
+  const [pendingAnswer, setPendingAnswer] = useState<PendingPayload | null>(null);
   useEffect(() => {
     const blkId = getActiveBlockId();
-    if (pendingAnswer && (pendingAnswer.blockId || blkId)) {
+    if (pendingAnswer && (pendingAnswer.blockId || blkId) && (pendingAnswer.question || questionRef.current)) {
       (async () => {
         const toSend = pendingAnswer;
         setPendingAnswer(null);
@@ -297,57 +266,49 @@ export default function InterviewPage() {
       })();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeBlock?.id, guided, selectedId, gIndex, qIndex, pendingAnswer]);
+  }, [activeBlock?.id, guided, selectedId, gIndex, qIndex]);
 
-  // ===== Envoi =====
+  // ===== Génère étiquette Q unique si déjà utilisée =====
+  function uniquifyQuestionForBlock(blockId: string, baseQ: string): string {
+    const b = blocksRef.current?.[blockId];
+    const entries = (b?.entries ?? []) as any[];
+    const same = entries.filter((e) => (e?.q ?? "") === baseQ);
+    if (same.length === 0) return baseQ;
+    return `${baseQ} (${same.length + 1})`;
+  }
+
+  // ===== Commit (save) =====
   async function commitAnswer(raw: string, ctx?: { blockId?: string; question?: string }) {
     const base = raw.trim();
     if (!base) return;
 
     const blkId = ctx?.blockId || blockIdRef.current;
-    const qRaw = ctx?.question || questionRef.current;
+    const qRaw  = ctx?.question || questionRef.current;
 
     if (!blkId || !blocksRef.current?.[blkId]) {
       setPendingAnswer({ text: base, blockId: blkId, question: qRaw });
       return;
     }
 
+    // Bulle utilisateur brute
     setMessages((prev) => [...prev, { role: "user", text: base, ts: Date.now() }]);
     setLastFinalRaw(base);
 
+    // Correction IA
     const corrected = await reformulate(base, blkId);
     setLastSavedText(corrected);
 
+    // Q stockée (unique)
+    const questionToStore = uniquifyQuestionForBlock(blkId, qRaw || "Question");
+
+    // Save bloc
     try {
-      await appendNarrative(blkId, corrected, { q: qRaw });
+      await addTextEntry(blkId, questionToStore, corrected);
     } catch (e) {
-      console.error("Échec appendNarrative:", e);
+      console.error("Échec addTextEntry:", e);
     }
 
-    // === GPT: prochaine question
-    try {
-      const res = await fetch("/api/llm/nextQuestion", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ blockId: blkId, lastAnswer: corrected }),
-      });
-
-      if (res.ok) {
-        const ct = res.headers.get("content-type") || "";
-        const json = ct.includes("application/json") ? await res.json() : {};
-        if (json?.ok && json.question) {
-          questionRef.current = json.question;
-          setMessages((prev) => [...prev, { role: "assistant", text: json.question, ts: Date.now() }]);
-          if (ttsOn) betterSpeak(json.question);
-          lastQuestionRef.current = json.question;
-          return;
-        }
-      }
-    } catch (e) {
-      console.error("Erreur nextQuestion:", e);
-    }
-
-    // === Fallback: pinned / progression guidée / libre
+    // Avancement guidé
     if (guidedRef.current) {
       const b = blocksRef.current?.[blkId];
       const p = b?.pinnedQuestions ?? [];
@@ -355,61 +316,102 @@ export default function InterviewPage() {
       const nextQi = qIndex + 1;
       if (nextQi < pqLen) {
         setQIndex(nextQi);
-      } else if (gIndexRef.current + 1 < scriptOrder.length) {
-        setGIndex(gIndexRef.current + 1);
-        setQIndex(0);
       } else {
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", text: "Merci, l’interview est terminée ✅", ts: Date.now() },
-        ]);
-        setGuided(false);
-      }
-    } else {
-      const p = (blocksRef.current?.[blkId]?.pinnedQuestions ?? []);
-      if (p.length) {
-        setFreeQIndexByBlock((prev) => {
-          const cur = prev[blkId] ?? 0;
-          const nxt = (cur + 1) % p.length;
-          return { ...prev, [blkId]: nxt };
-        });
-        const q = p[(freeQIndexByBlock[blkId] ?? 0 + 1) % p.length];
-        questionRef.current = q;
-        setMessages((prev) => [...prev, { role: "assistant", text: q, ts: Date.now() }]);
-        if (ttsOn) betterSpeak(q);
-        lastQuestionRef.current = q;
+        if (gIndexRef.current + 1 < scriptOrder.length) {
+          setGIndex(gIndexRef.current + 1);
+          setQIndex(0);
+        } else {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", text: "Merci, l’interview est terminée ✅", ts: Date.now() },
+          ]);
+          setGuided(false);
+        }
       }
     }
+
+    // Question IA suivante
+    try {
+      const blk = ctx?.blockId || blockIdRef.current;
+      const qIA = await fetchNextQuestionFor(blk || "", corrected);
+      const finalQ = qIA || nextQuestion;
+      setAiQ(finalQ);
+      setMessages((prev) => [...prev, { role: "assistant", text: finalQ, ts: Date.now() }]);
+      if (ttsOn) {
+        try { await speakTTS(finalQ, ttsVoice); } catch {}
+      }
+    } catch {}
   }
 
-  // ===== Draft clavier =====
+  // ===== Saisie clavier =====
   const [draft, setDraft] = useState("");
 
-  // ===== STT UI status =====
+  // ===== STT events =====
   const [status, setStatus] = useState("");
 
-  const handlePartial = (t: string) => {
-    const clean = t.trim();
-    setLivePartial(clean);
-    if (!clean) return;
+  function upsertDraft(text: string) {
     const key = "draft-singleton";
     setMessages((prev) => {
       const idx = prev.findIndex((m) => m.key === key);
-      const msg: Message = { role: "draft", text: clean, ts: Date.now(), key };
+      const msg: Message = { role: "draft", text, ts: Date.now(), key };
       if (idx === -1) return [...prev, msg];
       const newArr = prev.slice();
       newArr[idx] = msg;
       return newArr;
     });
+  }
+  function clearDraft() {
+    const key = "draft-singleton";
+    setMessages((prev) => prev.filter((m) => m.key !== key));
+  }
+
+  const handlePartial = (t: string) => {
+    const clean = t.trim();
+    setLivePartial(clean);
+    if (!clean) return;
+    upsertDraft(clean);
   };
 
   const handleFinal = async (t: string) => {
+    clearDraft();
     const clean = t.trim();
-    setMessages((prev) => prev.filter((m) => m.key !== "draft-singleton"));
-    if (!clean) { setLivePartial(""); return; }
-    await commitAnswer(clean, sttCtxRef.current || undefined);
+    if (!clean) {
+      setLivePartial("");
+      return;
+    }
+
+    const ctx = sttCtxRef.current || undefined;
+
+    if (!(ctx?.blockId || blockIdRef.current)) {
+      setLastFinalRaw(clean);
+      setPendingAnswer({ text: clean, blockId: ctx?.blockId, question: ctx?.question });
+      setLivePartial("");
+      return;
+    }
+
+    await commitAnswer(clean, ctx);
     setLivePartial("");
   };
+
+  // ===== Fallback injection si IA pas prête (une seule fois) =====
+  useEffect(() => {
+    if (!blkIdReady) return;
+
+    const last = messages[messages.length - 1];
+    const lastIsAssistant = last?.role === "assistant";
+    const lastText = (last?.text || "").trim();
+    const fallbackQ = nextQuestion.trim();
+
+    if (lastIsAssistant && (lastText === fallbackQ || lastText === aiQ.trim())) return;
+
+    if (!aiQ) {
+      setMessages((prev) => [...prev, { role: "assistant", text: fallbackQ, ts: Date.now() }]);
+      if (ttsOn) {
+        try { speakTTS(fallbackQ, ttsVoice); } catch {}
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blkIdReady, activeBlock?.id, nextQuestion, ttsOn, ttsVoice]);
 
   if (loading || !blocks) return <div className="p-6">Chargement…</div>;
 
@@ -422,23 +424,25 @@ export default function InterviewPage() {
         </button>
       </header>
 
-      {/* Contrôles haut */}
+      {/* Contrôles principaux */}
       <section className="space-y-2 border rounded-xl p-4 bg-white">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">
             {/* Mode */}
-            <button
-              onClick={() => setMode("voice")}
-              className={`px-3 py-2 border rounded text-sm ${mode === "voice" ? "bg-gray-100" : "hover:bg-gray-50"}`}
-            >
-              Voix
-            </button>
-            <button
-              onClick={() => setMode("text")}
-              className={`px-3 py-2 border rounded text-sm ${mode === "text" ? "bg-gray-100" : "hover:bg-gray-50"}`}
-            >
-              Texte
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                className={`px-3 py-2 border rounded text-sm ${mode === "voice" ? "bg-gray-100" : "hover:bg-gray-50"}`}
+                onClick={() => setMode("voice")}
+              >
+                Voix
+              </button>
+              <button
+                className={`px-3 py-2 border rounded text-sm ${mode === "text" ? "bg-gray-100" : "hover:bg-gray-50"}`}
+                onClick={() => setMode("text")}
+              >
+                Texte
+              </button>
+            </div>
 
             {/* Guidé */}
             <label className="flex items-center gap-2 text-sm">
@@ -460,6 +464,7 @@ export default function InterviewPage() {
               Parcours guidé
             </label>
 
+            {/* Contexte guidé */}
             {guided ? (
               <div className="text-xs text-gray-600">
                 Bloc&nbsp;
@@ -473,26 +478,58 @@ export default function InterviewPage() {
             )}
           </div>
 
-          {/* TTS + IA */}
-          <div className="flex items-center gap-4 text-xs">
+          {/* TTS + IA switches + Sélecteur de voix */}
+          <div className="flex items-center gap-3 text-xs">
             <label className="flex items-center gap-2">
-              <input type="checkbox" checked={ttsOn} onChange={(e) => setTtsOn(e.target.checked)} />
-              Lecture vocale
+              <input
+                type="checkbox"
+                checked={ttsOn}
+                onChange={(e) => setTtsOn(e.target.checked)}
+              />
+              Lecture vocale des questions
             </label>
-            <select
-              className="border rounded p-1 text-xs"
-              value={voice}
-              onChange={(e) => setVoice(e.target.value)}
-              title="Choisir la voix"
-            >
-              <option value="alloy">Alloy</option>
-              <option value="verse">Verse</option>
-              <option value="shimmer">Shimmer</option>
-              <option value="sage">Sage</option>
-            </select>
+
+            <div className="flex items-center gap-2">
+              <span className="text-gray-600">Voix</span>
+              <select
+                className="border rounded p-1 text-xs"
+                value={ttsVoice}
+                onChange={(e) => setTtsVoice(e.target.value)}
+                disabled={!ttsOn || ttsLoading}
+                title="Sélection de la voix TTS OpenAI"
+              >
+                <option value="alloy">alloy</option>
+                <option value="verve">verve</option>
+                <option value="ember">ember</option>
+                <option value="sage">sage</option>
+                <option value="verse">verse</option>
+              </select>
+              <button
+                className="px-2 py-1 border rounded text-xs hover:bg-gray-50"
+                onClick={() => speakTTS("D'accord, je te lis les questions avec cette voix.", ttsVoice)}
+                disabled={!ttsOn || ttsLoading}
+                title="Tester la voix"
+              >
+                Tester
+              </button>
+            </div>
+
             <label className="flex items-center gap-2">
-              <input type="checkbox" checked={aiOptIn} onChange={(e) => setAiOptIn(e.target.checked)} />
-              Correction IA
+              <input
+                type="checkbox"
+                checked={aiOptIn}
+                onChange={(e) => setAiOptIn(e.target.checked)}
+              />
+              Correction automatique (IA)
+            </label>
+
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={aiEnabled}
+                onChange={(e) => setAiEnabled(e.target.checked)}
+              />
+              Questions naturelles (LLM)
             </label>
           </div>
         </div>
@@ -505,7 +542,10 @@ export default function InterviewPage() {
               <select
                 className="w-full border rounded p-2 text-sm"
                 value={selectedId}
-                onChange={(e) => { setSelectedId(e.target.value); setMessages([]); }}
+                onChange={(e) => {
+                  setSelectedId(e.target.value);
+                  // messages reset → fait sur changement de activeBlock.id
+                }}
               >
                 {items.map((b) => (
                   <option key={b.id} value={b.id}>
@@ -517,25 +557,16 @@ export default function InterviewPage() {
 
             {/* STT moteur */}
             {mode === "voice" && (
-              <div className="flex items-center gap-3">
-                <label className="text-xs text-gray-600 flex items-center gap-2">
-                  <input type="checkbox" checked={usePro} onChange={(e) => setUsePro(e.target.checked)} />
-                  STT Deepgram (pro)
-                </label>
-
-                {!usePro && (
-                  <label className="text-xs text-gray-600 flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={autoSTT}
-                      onChange={(e) => setAutoSTT(e.target.checked)}
-                      title="Relance auto, mains libres"
-                    />
-                    Mains libres (auto)
-                  </label>
-                )}
-              </div>
+              <label className="text-xs text-gray-600 flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={usePro}
+                  onChange={(e) => setUsePro(e.target.checked)}
+                />
+                STT Deepgram (pro)
+              </label>
             )}
+            {mode === "voice" && <span className="text-xs text-gray-500">{status || "—"}</span>}
           </div>
         )}
       </section>
@@ -543,12 +574,17 @@ export default function InterviewPage() {
       {/* Fil de chat */}
       <section className="border rounded-xl p-3 bg-white space-y-2" style={{ minHeight: 360 }}>
         {messages.map((m, i) => (
-          <div key={m.key ?? i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+          <div
+            key={m.key ?? i}
+            className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
+          >
             <div
               className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm shadow ${
-                m.role === "assistant" ? "bg-indigo-50 text-indigo-900"
-                : m.role === "draft" ? "bg-yellow-50 text-yellow-900"
-                : "bg-gray-100 text-gray-900"
+                m.role === "assistant"
+                  ? "bg-indigo-50 text-indigo-900"
+                  : m.role === "draft"
+                  ? "bg-yellow-50 text-yellow-900"
+                  : "bg-gray-100 text-gray-900"
               }`}
             >
               {m.text}
@@ -559,16 +595,19 @@ export default function InterviewPage() {
 
       {/* Entrées */}
       <section className="flex flex-col gap-3">
+        {/* Voix */}
         {mode === "voice" && (
           <div className="flex items-center gap-2">
             {usePro ? (
               <DeepgramSTT
                 onPartial={handlePartial}
                 onFinal={handleFinal}
-                setStatus={(s) => setStatus(s)}
+                setStatus={setStatus}
                 onStart={() => {
-                  // capture le contexte
-                  sttCtxRef.current = { blockId: getActiveBlockId(), question: questionRef.current };
+                  sttCtxRef.current = {
+                    blockId: getActiveBlockId(),
+                    question: aiQ || questionRef.current,
+                  };
                 }}
                 onStop={() => {}}
                 buttonLabel="Parler (Deepgram)"
@@ -577,21 +616,26 @@ export default function InterviewPage() {
               <LiveSTT
                 onPartial={handlePartial}
                 onFinal={handleFinal}
-                setStatus={(s) => setStatus(s)}
+                setStatus={setStatus}
                 onStart={() => {
-                  sttCtxRef.current = { blockId: getActiveBlockId(), question: questionRef.current };
+                  sttCtxRef.current = {
+                    blockId: getActiveBlockId(),
+                    question: aiQ || questionRef.current,
+                  };
                 }}
                 onStop={() => {}}
                 buttonLabel="Parler (navigateur)"
-                auto={autoSTT}
-                lang="fr-FR"
-                autoRestartDelayMs={250}
               />
             )}
-            <span className="text-xs text-gray-500">{status || "—"}</span>
+            <span className="text-xs text-gray-500">
+              {blkIdReady
+                ? "Parle, j’affiche en jaune. À l’arrêt, j’enregistre (corrigé) et je relance."
+                : "Choisis un bloc ou active le parcours guidé."}
+            </span>
           </div>
         )}
 
+        {/* Texte */}
         {mode === "text" && (
           <div className="flex gap-2">
             <input
@@ -602,21 +646,31 @@ export default function InterviewPage() {
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
+                  if (!blkIdReady) return;
                   const text = draft.trim();
-                  if (!text) return;
-                  commitAnswer(text, { blockId: getActiveBlockId(), question: questionRef.current });
-                  setDraft("");
+                  if (text) {
+                    commitAnswer(text, {
+                      blockId: getActiveBlockId(),
+                      question: aiQ || questionRef.current,
+                    });
+                    setDraft("");
+                  }
                 }
               }}
             />
             <button
+              className="px-3 py-2 border rounded text-sm hover:bg-gray-50"
+              disabled={!blkIdReady}
               onClick={() => {
                 const text = draft.trim();
-                if (!text) return;
-                commitAnswer(text, { blockId: getActiveBlockId(), question: questionRef.current });
-                setDraft("");
+                if (text) {
+                  commitAnswer(text, {
+                    blockId: getActiveBlockId(),
+                    question: aiQ || questionRef.current,
+                  });
+                  setDraft("");
+                }
               }}
-              className="px-3 py-2 border rounded text-sm hover:bg-gray-50"
             >
               Envoyer
             </button>
@@ -624,7 +678,7 @@ export default function InterviewPage() {
         )}
       </section>
 
-      {/* Transcription */}
+      {/* Transcription récente */}
       <section className="space-y-2 border rounded-xl p-4 bg-white">
         <div className="text-xs uppercase tracking-wide text-gray-500">Transcription récente</div>
         <div className="grid sm:grid-cols-3 gap-3 text-sm">
@@ -649,66 +703,31 @@ export default function InterviewPage() {
         </div>
       </section>
 
-      {/* Mémoire narrative */}
-      {activeBlock && (
-  <section className="space-y-2 border rounded-xl p-4 bg-white">
-    <div className="text-xs uppercase tracking-wide text-gray-500">
-      Résumé (IA) — {activeBlock.title}
-    </div>
-    <div className="whitespace-pre-wrap text-sm bg-indigo-50/40 border rounded p-3 min-h-[80px]">
-      {(activeBlock.summary ?? "").trim() || <em className="text-gray-400">— encore aucun résumé —</em>}
-    </div>
-  </section>
-)}
-
-      {/* Historique Q/R (optionnel) */}
+      {/* Historique récent */}
       {activeBlock && activeBlock.entries.length > 0 && (
         <section className="space-y-2 border rounded-xl p-4 bg-white">
           <div className="text-xs uppercase tracking-wide text-gray-500">
-            Anciennes entrées — {activeBlock.title}
+            Dernières entrées — {activeBlock.title}
           </div>
           <ul className="space-y-2">
             {activeBlock.entries
               .slice()
               .reverse()
               .slice(0, 5)
-              .map((e: Entry, i: number) => {
-                if (e.type === "texte" || e.type === "audio") {
-                  return (
-                    <li key={i} className="border rounded p-3 bg-white">
-                      <div className="text-sm">
-                        <span className="font-medium">Q:&nbsp;</span>
-                        {(e as any).q}
-                      </div>
-                      <div className="text-sm">
-                        <span className="font-medium">A:&nbsp;</span>
-                        {(e as any).a}
-                      </div>
-                      {e.type === "audio" && (e as any).audioUrl && (
-                        <div className="mt-2">
-                          <audio controls src={(e as any).audioUrl} />
-                        </div>
-                      )}
-                    </li>
-                  );
-                }
-                if (e.type === "photo") {
-                  return (
-                    <li key={i} className="border rounded p-3 bg-white">
-                      <div className="text-sm mb-2">
-                        <span className="font-medium">Photo:&nbsp;</span>
-                        {(e as any).caption || "(sans légende)"}
-                      </div>
-                      <img
-                        src={(e as any).url}
-                        alt={(e as any).caption || "photo"}
-                        className="max-h-48 rounded border"
-                      />
-                    </li>
-                  );
-                }
-                return null;
-              })}
+              .map((e: Entry, i: number) => (
+                <li key={i} className="border rounded p-3 bg-white">
+                  {"q" in e && (
+                    <div className="text-sm">
+                      <span className="font-medium">Q:</span> {(e as any).q}
+                    </div>
+                  )}
+                  {"a" in e && (
+                    <div className="text-sm">
+                      <span className="font-medium">A:</span> {(e as any).a}
+                    </div>
+                  )}
+                </li>
+              ))}
           </ul>
         </section>
       )}

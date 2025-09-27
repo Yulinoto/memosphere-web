@@ -1,39 +1,56 @@
 // src/hooks/useBlocks.ts
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import type { BlocksState, Entry, Block } from "@/data/blocks";
 import { loadBlocks, saveBlocks, resetBlocks } from "@/lib/storage";
+import schemaJson from "@/data/interviewSchema.json";
 
-/** Heuristique simple pour le % d'avancement (améliorable plus tard) */
-function recomputeProgress(entriesLen: number) {
-  return Math.min(100, Math.round((entriesLen / 6) * 100));
+/** Pondération simple */
+function cov(status: "present" | "partial" | "missing" | "conflict") {
+  if (status === "present") return 1;
+  if (status === "partial") return 0.5;
+  return 0;
 }
 
-/** Normalise un bloc importé pour éviter les surprises */
+/** Recalc progress basé sur la checklist si dispo; sinon fallback nb entrées */
+function recomputeProgress(block: Block): number {
+  if ((block as any).checklist && Object.keys((block as any).checklist).length) {
+    const blkSchema: any = (schemaJson as any)[block.id];
+    if (!blkSchema || !Array.isArray(blkSchema.slots)) return 0;
+    let wsum = 0, got = 0;
+    for (const s of blkSchema.slots) {
+      const w = Number(s.weight) || 1;
+      wsum += w;
+      const st = (block as any).checklist?.[s.id]?.status ?? "missing";
+      got += w * cov(st);
+    }
+    if (!wsum) return 0;
+    return Math.max(0, Math.min(100, Math.round((got / wsum) * 100)));
+  }
+  return Math.min(100, Math.round((block.entries.length / 6) * 100));
+}
+
+/** Sanitize block */
 function sanitizeBlock(raw: any): Block {
   const id = String(raw?.id ?? "");
   const title = String((raw?.title ?? id) || "Sans titre");
-
   const entries: Entry[] = Array.isArray(raw?.entries) ? raw.entries : [];
-  const progress =
-    typeof raw?.progress === "number" ? raw.progress : recomputeProgress(entries.length);
-
-  const summary =
-    typeof raw?.summary === "string" || raw?.summary === null ? raw.summary : null;
-
+  const summary = typeof raw?.summary === "string" || raw?.summary === null ? raw.summary : null;
   const pinnedQuestions = Array.isArray(raw?.pinnedQuestions)
     ? raw.pinnedQuestions.map((x: any) => String(x))
     : undefined;
+  const content = typeof raw?.content === "string" ? raw.content : "";
+  const checklist = raw?.checklist && typeof raw.checklist === "object" ? raw.checklist : undefined;
 
-  // Important : content doit toujours être une string
-  const content =
-    typeof raw?.content === "string" ? raw.content : "";
-
-  return { id, title, progress, entries, summary, pinnedQuestions, content };
+  const draft: Block = { id, title, progress: 0, entries, summary, pinnedQuestions } as any;
+  (draft as any).content = content;
+  (draft as any).checklist = checklist;
+  draft.progress = recomputeProgress(draft);
+  return draft;
 }
 
-/** Normalise tout l'état importé */
+/** Sanitize state */
 function sanitizeState(raw: any): BlocksState {
   const out: BlocksState = {};
   if (!raw || typeof raw !== "object") return out;
@@ -47,169 +64,159 @@ function sanitizeState(raw: any): BlocksState {
 export function useBlocks() {
   const [blocks, setBlocks] = useState<BlocksState | null>(null);
   const [loading, setLoading] = useState(true);
+  const blocksRef = useRef<BlocksState | null>(null);
 
-  /** Chaîne de sauvegarde pour sérialiser les writes (évite les collisions IndexedDB) */
-  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
+  useEffect(() => { blocksRef.current = blocks; }, [blocks]);
 
-  /** Programme une sauvegarde (sérialisée) */
-  const scheduleSave = useCallback((stateToSave: BlocksState) => {
-    saveChainRef.current = saveChainRef.current
-      .then(() => saveBlocks(stateToSave))
-      .catch((e) => {
-        console.error("[storage] save error:", e);
-      });
-  }, []);
-
-  // Init
   useEffect(() => {
     (async () => {
-      const loaded = await loadBlocks();
-      const sane = sanitizeState(loaded); // migration
-      setBlocks(sane);
-      scheduleSave(sane); // re-persist propre
+      const b = await loadBlocks();
+      const fixed: BlocksState = {};
+      for (const id of Object.keys(b)) fixed[id] = sanitizeBlock(b[id]);
+      setBlocks(fixed);
+      blocksRef.current = fixed;
       setLoading(false);
     })();
-  }, [scheduleSave]);
+  }, []);
 
-  // --- Actions publiques ---
+  /** persist — race-safe */
+  const persist = useCallback(
+    async (updater: (prev: BlocksState) => BlocksState) => {
+      setBlocks(prev => {
+        const base = (prev ?? {}) as BlocksState;
+        const next = updater(base);
+        blocksRef.current = next;
+        saveBlocks(next).catch(() => {});
+        return next;
+      });
+    },
+    []
+  );
 
-  /** Q/R classique (compat) */
   const addTextEntry = useCallback(
     async (blockId: string, q: string, a: string) => {
-      setBlocks((prev) => {
-        if (!prev) return prev;
-        const block = prev[blockId];
+      await persist((prev) => {
+        const b = { ...prev };
+        const block = b[blockId];
         if (!block) return prev;
-
         const entry: Entry = { type: "texte", q, a, ts: Date.now() };
         const entries = [...block.entries, entry];
-        const progress = recomputeProgress(entries.length);
-
-        const next: BlocksState = {
-          ...prev,
-          [blockId]: { ...block, entries, progress },
-        };
-        scheduleSave(next);
-        return next;
+        const tmp: Block = { ...block, entries };
+        tmp.progress = recomputeProgress(tmp);
+        b[blockId] = tmp;
+        return b;
       });
     },
-    [scheduleSave]
+    [persist]
   );
 
-  /** Append narratif + (optionnel) log Q/R */
-  const appendNarrative = useCallback(
-    async (blockId: string, text: string, meta?: { q?: string }) => {
-      const trimmed = (text ?? "").trim();
-      if (!trimmed) return;
-
-      setBlocks((prev) => {
-        if (!prev) return prev;
-        const block = prev[blockId];
-        if (!block) return prev;
-
-        const oldContent = typeof block.content === "string" ? block.content : "";
-        const sep = oldContent.trim() ? "\n\n" : "";
-        const content = oldContent + sep + trimmed;
-
-        let entries = block.entries;
-        if (meta?.q) {
-          const entry: Entry = { type: "texte", q: meta.q, a: trimmed, ts: Date.now() };
-          entries = [...entries, entry];
-        }
-
-        const progress = recomputeProgress(entries.length);
-
-        const next: BlocksState = {
-          ...prev,
-          [blockId]: { ...block, content, entries, progress },
-        };
-        scheduleSave(next);
-        return next;
-      });
-    },
-    [scheduleSave]
-  );
-
-  /** Écrase entièrement le contenu narratif du bloc (éditeur texte) */
-  const setContent = useCallback(
-    async (blockId: string, content: string) => {
-      setBlocks((prev) => {
-        if (!prev) return prev;
-        const block = prev[blockId];
-        if (!block) return prev;
-
-        const next: BlocksState = {
-          ...prev,
-          [blockId]: { ...block, content: String(content ?? "") },
-        };
-        scheduleSave(next);
-        return next;
-      });
-    },
-    [scheduleSave]
-  );
-
-  /** Résumé IA */
   const setSummary = useCallback(
     async (blockId: string, summary: string) => {
-      setBlocks((prev) => {
-        if (!prev) return prev;
-        const block = prev[blockId];
+      await persist((prev) => {
+        const b = { ...prev };
+        const block = b[blockId];
         if (!block) return prev;
-        const next: BlocksState = {
-          ...prev,
-          [blockId]: { ...block, summary },
-        };
-        scheduleSave(next);
-        return next;
+        b[blockId] = { ...block, summary };
+        return b;
       });
     },
-    [scheduleSave]
+    [persist]
   );
 
-  /** Renommer un bloc */
+  const setContent = useCallback(
+    async (blockId: string, content: string) => {
+      await persist((prev) => {
+        const b = { ...prev };
+        const block: any = b[blockId];
+        if (!block) return prev;
+        const next: any = { ...block, content };
+        next.progress = recomputeProgress(next as Block);
+        b[blockId] = next;
+        return b;
+      });
+    },
+    [persist]
+  );
+
   const renameBlock = useCallback(
     async (blockId: string, title: string) => {
-      setBlocks((prev) => {
-        if (!prev) return prev;
-        const block = prev[blockId];
+      await persist((prev) => {
+        const b = { ...prev };
+        const block = b[blockId];
         if (!block) return prev;
-
-        const next: BlocksState = {
-          ...prev,
-          [blockId]: { ...block, title: String(title || block.title) },
-        };
-        scheduleSave(next);
-        return next;
+        b[blockId] = { ...block, title };
+        return b;
       });
     },
-    [scheduleSave]
+    [persist]
   );
 
-  /** Réinitialisation complète */
   const clearAll = useCallback(async () => {
     const fresh = await resetBlocks();
-    const sane = sanitizeState(fresh);
-    setBlocks(sane);
-    scheduleSave(sane);
-  }, [scheduleSave]);
+    const fixed: BlocksState = {};
+    for (const id of Object.keys(fresh)) fixed[id] = sanitizeBlock(fresh[id]);
+    setBlocks(fixed);
+    blocksRef.current = fixed;
+  }, []);
 
-  /** Import JSON → remplace tout l'état + persiste */
   const importBlocks = useCallback(async (raw: unknown) => {
     const next = sanitizeState(raw);
     setBlocks(next);
-    scheduleSave(next);
-  }, [scheduleSave]);
+    blocksRef.current = next;
+    await saveBlocks(next);
+  }, []);
+
+  const updateChecklist = useCallback(
+    async (blockId: string, checklist: Record<string, { status: "present" | "partial" | "missing" | "conflict"; confidence: number; evidenceEntryIdx?: number[] }>) => {
+      await persist((prev) => {
+        const b = { ...prev };
+        const block: any = b[blockId];
+        if (!block) return prev;
+        const next: any = { ...block, checklist };
+        next.progress = recomputeProgress(next as Block);
+        b[blockId] = next;
+        return b;
+      });
+    },
+    [persist]
+  );
+
+  const analyzeNow = useCallback(async (blockId: string) => {
+    const snap = blocksRef.current;
+    if (!snap) return;
+    const block = snap[blockId];
+    if (!block) return;
+    const blkSchema: any = (schemaJson as any)[block.id];
+    if (!blkSchema) return;
+
+    try {
+      const res = await fetch("/api/llm/gaps", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          blockId: block.id,
+          entries: block.entries,
+          schema: blkSchema,
+        }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json?.ok) return;
+      await updateChecklist(block.id, json.checklist || {});
+    } catch (e) {
+      console.warn("gaps analyze failed:", e);
+    }
+  }, [updateChecklist]);
 
   return {
     loading,
-    blocks,            // Record<string, Block>
-    addTextEntry,      // (blockId, q, a)
-    appendNarrative,   // (blockId, text, {q?})
-    setContent,        // (blockId, content)  <-- NOUVEAU
-    setSummary,        // (blockId, summary)
-    renameBlock,       // (blockId, title)
-    clearAll,          // reset vers DEFAULT_BLOCKS
-    importBlocks,      // import JSON (remplacement complet)
+    blocks,
+    addTextEntry,
+    setSummary,
+    setContent,
+    renameBlock,
+    clearAll,
+    importBlocks,
+    updateChecklist,
+    analyzeNow,
   };
 }

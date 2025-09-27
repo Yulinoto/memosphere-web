@@ -2,9 +2,11 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useBlocks } from "@/hooks/useBlocks";
 import type { Block, Entry } from "@/data/blocks";
 import { summarizeBlockLLM } from "@/lib/summarize";
+import schemaJson from "@/data/interviewSchema.json";
 
 /** Petit gestionnaire d'historique local (undo/redo + coalescing) */
 function useUndoManager(initial = "", coalesceMs = 400) {
@@ -84,8 +86,197 @@ function useUndoManager(initial = "", coalesceMs = 400) {
   };
 }
 
+/** util — mini slugify stable pour id de slot */
+function slotIdFromLabel(label: string) {
+  return String(label || "")
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // accents
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 64);
+}
+
+/** Pastilles d'objectifs locales (dérive slots depuis must_have si besoin) */
+function ChecklistChipsLocal({
+  blockId,
+  checklist,
+}: {
+  blockId: string;
+  checklist: Record<string, any> | undefined;
+}) {
+  const raw = (schemaJson as any)?.[blockId];
+  if (!raw) {
+    return (
+      <div className="text-xs text-gray-500 mt-2">
+        Aucun schéma d’objectifs pour ce bloc.
+      </div>
+    );
+  }
+
+  // 1) si le schéma a déjà des slots, on les utilise
+  let slots: Array<{ id: string; label: string }> = Array.isArray(raw.slots)
+    ? raw.slots
+    : [];
+
+  // 2) sinon on dérive des "must_have"
+  if (!slots.length && Array.isArray(raw.must_have)) {
+    slots = raw.must_have.map((label: string) => ({
+      id: slotIdFromLabel(label),
+      label,
+    }));
+  }
+
+  if (!slots.length) {
+    return (
+      <div className="text-xs text-gray-500 mt-2">
+        Aucun objectif exploitable dans ce schéma.
+      </div>
+    );
+  }
+
+  const cl = checklist || {};
+  return (
+    <div className="mt-2 flex flex-wrap gap-2">
+      {slots.map((slot) => {
+        const st = cl[slot.id]?.status || "missing";
+        const cls =
+          st === "present"
+            ? "bg-green-100 text-green-800 border-green-200"
+            : st === "partial"
+            ? "bg-amber-100 text-amber-800 border-amber-200"
+            : st === "conflict"
+            ? "bg-rose-100 text-rose-800 border-rose-200"
+            : "bg-gray-100 text-gray-700 border-gray-200";
+
+        return (
+          <span
+            key={slot.id}
+            className={`text-xs px-2 py-1 rounded border ${cls}`}
+            title={slot.id}
+          >
+            {slot.label}
+            {st === "present"
+              ? " ✓"
+              : st === "partial"
+              ? " ~"
+              : st === "conflict"
+              ? " !"
+              : " ✗"}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+// --- Helpers jauge (ne remplace rien) ---
+function deriveSlotsForBlock(blockId: string) {
+  const raw: any = (schemaJson as any)?.[blockId];
+  if (!raw) return [];
+  if (Array.isArray(raw.slots) && raw.slots.length) return raw.slots;
+  if (Array.isArray(raw.must_have)) {
+    const slug = (s: string) =>
+      String(s || "")
+        .toLowerCase()
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .slice(0, 64);
+    return raw.must_have.map((label: string) => ({ id: slug(label), label }));
+  }
+  return [];
+}
+
+function computeProgressLocal(blockId: string, checklist?: Record<string, any>) {
+  const slots = deriveSlotsForBlock(blockId);
+  if (!slots.length || !checklist) return { pct: 0, present: 0, total: slots.length };
+  let score = 0; // present=1, partial=0.5
+  for (const s of slots) {
+    const st = checklist[s.id]?.status;
+    if (st === "present") score += 1;
+    else if (st === "partial") score += 0.5;
+  }
+  const pct = slots.length ? Math.round((score / slots.length) * 100) : 0;
+  return { pct, present: Math.round(score), total: slots.length };
+}
+
+/* ============================================================
+   Cache locale d'analyse (stale-while-revalidate)
+   ============================================================ */
+type CachedAnalysis = {
+  checklist: Record<string, any>;
+  progress: number;
+  relances: any[];
+  hash: string;           // empreinte des données
+  updatedAt: number;      // ts ms
+};
+
+function hash32(s: string) {
+  let h = 2166136261 >>> 0; // FNV-1a-ish simple
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+
+function makeBlockHash(b: any) {
+  // Empreinte légère des données qui importent pour l’analyse
+  const entriesLite = Array.isArray(b?.entries)
+    ? b.entries.map((e: any) => ({ q: e?.q || "", a: e?.a || "" }))
+    : [];
+  const content = b?.content || "";
+  return hash32(JSON.stringify({ entriesLite, content }));
+}
+
+function loadCachedAnalysis(blockId: string): CachedAnalysis | null {
+  try {
+    const raw = localStorage.getItem(`gaps_cache_${blockId}`);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object") return null;
+    return obj as CachedAnalysis;
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedAnalysis(blockId: string, data: CachedAnalysis) {
+  try {
+    localStorage.setItem(`gaps_cache_${blockId}`, JSON.stringify(data));
+  } catch {}
+}
+
+/* ============================================================
+   IMPORT / EXPORT JSON
+   ============================================================ */
+function downloadText(filename: string, text: string) {
+  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+function yyyymmdd_hhmm(d = new Date()) {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
 export default function BlocksPage() {
-  const { loading, blocks, setSummary, setContent, renameBlock, clearAll } = useBlocks();
+  const router = useRouter();
+  const {
+    loading,
+    blocks,
+    setSummary,
+    setContent,
+    renameBlock,
+    clearAll,
+    importBlocks,              // ⟵ on l’expose ici
+  } = useBlocks();
   const list = useMemo(() => (blocks ? Object.values(blocks) : []), [blocks]);
 
   const [activeId, setActiveId] = useState<string>("");
@@ -93,7 +284,7 @@ export default function BlocksPage() {
   const [busyReset, setBusyReset] = useState(false);
 
   const active = useMemo<Block | null>(
-    () => (activeId && blocks ? blocks[activeId] ?? null : list[0] ?? null),
+    () => (activeId && blocks ? (blocks as any)[activeId] ?? null : list[0] ?? null),
     [activeId, blocks, list]
   );
 
@@ -115,7 +306,7 @@ export default function BlocksPage() {
 
   // hydrate contenu quand on change de bloc
   useEffect(() => {
-    const initial = active?.content ?? "";
+    const initial = (active as any)?.content ?? "";
     contentMgr.reset(initial);
     setContentSaveState("idle");
     if (contentTimerRef.current) {
@@ -128,12 +319,12 @@ export default function BlocksPage() {
   useEffect(() => {
     if (!active) return;
     const current = contentMgr.value;
-    if (current === (active.content ?? "")) return;
+    if (current === ((active as any).content ?? "")) return;
     setContentSaveState("saving");
     if (contentTimerRef.current) window.clearTimeout(contentTimerRef.current);
     contentTimerRef.current = window.setTimeout(async () => {
       try {
-        await setContent(active.id, current);
+        await setContent((active as any).id, current);
         setContentSaveState("saved");
         contentMgr.markSaved(current); // aligne le snapshot “enregistré”
         window.setTimeout(() => setContentSaveState("idle"), 800);
@@ -180,13 +371,218 @@ export default function BlocksPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [summaryMgr.value, active?.id]);
 
+  // -----------------------------------------
+  // Agent de complétude — local à la page
+  // -----------------------------------------
+  // on garde une table des checklists par bloc, pour ne pas dépendre du hook
+  const [checklists, setChecklists] = useState<Record<string, any>>({});
+  const [analyzing, setAnalyzing] = useState(false);
+  const [relances, setRelances] = useState<Record<string, any[]>>({}); // relances par bloc (optionnel)
+  const [lastAnalysisAt, setLastAnalysisAt] = useState<number | null>(null);
+
+  // Hydrate affichage depuis cache quand on change de bloc
+  useEffect(() => {
+    const b = active as any;
+    if (!b?.id) return;
+
+    const cached = loadCachedAnalysis(b.id);
+    if (!cached) {
+      setChecklists((prev) => ({ ...prev, [b.id]: undefined }));
+      setRelances((prev) => ({ ...prev, [b.id]: [] }));
+      setLastAnalysisAt(null);
+      return;
+    }
+
+    const currentHash = makeBlockHash(b);
+    if (cached.hash === currentHash) {
+      setChecklists((prev) => ({ ...prev, [b.id]: cached.checklist || {} }));
+      setRelances((prev) => ({ ...prev, [b.id]: cached.relances || [] }));
+      setLastAnalysisAt(cached.updatedAt || null);
+    } else {
+      // hash différent → invalide la vue pour déclencher auto-analyse
+      setChecklists((prev) => ({ ...prev, [b.id]: undefined }));
+      setRelances((prev) => ({ ...prev, [b.id]: [] }));
+      setLastAnalysisAt(null);
+    }
+  }, [active?.id]);
+
+  // ⚡ Auto-analyse à l’ouverture/au changement de bloc si pas de cache valide
+  useEffect(() => {
+    const b = active as any;
+    if (!b?.id) return;
+    const toAnalyze = checklists[b.id] === undefined; // undefined = pas de cache valide
+    if (toAnalyze && !analyzing) {
+      analyzeActiveNow();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active?.id, checklists, analyzing]);
+
+  async function analyzeActiveNow() {
+    const b = active as any;
+    if (!b) return;
+    const raw = (schemaJson as any)?.[b.id];
+    if (!raw) return;
+
+    // Derive slots ici (mêmes ids que l’UI)
+    const slots = Array.isArray(raw.slots) && raw.slots.length
+      ? raw.slots
+      : Array.isArray(raw.must_have)
+        ? raw.must_have.map((label: string) => ({
+            id: String(label || "")
+              .toLowerCase()
+              .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+              .replace(/[^a-z0-9]+/g, "_")
+              .replace(/^_+|_+$/g, "")
+              .slice(0, 64),
+            label,
+          }))
+        : [];
+
+    try {
+      setAnalyzing(true);
+      const res = await fetch("/api/llm/gaps", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          blockId: b.id,
+          entries: b.entries || [],
+          content: b.content || "",       // <— on envoie le récit brut
+          schema: raw,
+          slots,                          // <— on envoie les slots alignés
+        }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && json?.ok) {
+        setChecklists((prev) => ({ ...prev, [b.id]: json.checklist || {} }));
+        if (Array.isArray(json.relances)) {
+          setRelances((prev) => ({ ...prev, [b.id]: json.relances }));
+        }
+        // ★ Sauvegarde cache
+        const payload = {
+          checklist: json.checklist || {},
+          progress: typeof json.progress === "number" ? json.progress : 0,
+          relances: Array.isArray(json.relances) ? json.relances : [],
+          hash: makeBlockHash(b),
+          updatedAt: Date.now(),
+        } as CachedAnalysis;
+        saveCachedAnalysis(b.id, payload);
+        setLastAnalysisAt(payload.updatedAt);
+      }
+    } catch {
+      // no-op UI
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  const activeChecklist = active ? checklists[(active as any).id] : undefined;
+  const activeRelances = active ? relances[(active as any).id] : undefined;
+
+  // ★ Jauge locale (ne remplace rien)
+  const progressView = active
+    ? computeProgressLocal((active as any).id, activeChecklist)
+    : { pct: 0, present: 0, total: 0 };
+
+  // ===== Import / Export =====
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleExport = () => {
+    try {
+      const payload = {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        data: blocks || {},
+      };
+      downloadText(`memosphere-${yyyymmdd_hhmm()}.json`, JSON.stringify(payload, null, 2));
+    } catch (e) {
+      console.error("[export] error:", e);
+      alert("Export impossible.");
+    }
+  };
+
+  const handleImportClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // reset pour permettre ré-import du même fichier
+    if (!file) return;
+    try {
+      const text = await file.text();
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        alert("Fichier invalide (JSON mal formé).");
+        return;
+      }
+      const data = json?.data || json; // tolère export brut
+      if (!data || typeof data !== "object") {
+        alert("Fichier invalide (pas de champ data).");
+        return;
+      }
+      await importBlocks(data); // remplace les blocs + persiste
+      // Invalide le cache d’analyse local (pour toutes les ids présentes)
+      try {
+        Object.keys(data).forEach((id) => {
+          localStorage.removeItem(`gaps_cache_${id}`);
+        });
+      } catch {}
+      alert("Import terminé ✅");
+      // force une “réouverture” logique du bloc actif pour ré-hydrater
+      setActiveId((prev) => (prev ? "" : prev));
+      setTimeout(() => setActiveId((active as any)?.id ?? ""), 0);
+    } catch (err) {
+      console.error("[import] error:", err);
+      alert("Import impossible.");
+    }
+  };
+
   if (loading) return <div className="p-6">Chargement…</div>;
   if (!list.length) return <div className="p-6">Aucun bloc.</div>;
 
   return (
     <main className="max-w-5xl mx-auto p-6 space-y-6">
-      <header className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Blocs</h1>
+      <header className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => router.push("/interview")}
+            className="text-sm border rounded-lg px-3 py-2 bg-white hover:bg-gray-50"
+            title="Retourner à l’interview"
+          >
+            ← Revenir à l’interview
+          </button>
+
+          {/* Import / Export */}
+          <button
+            type="button"
+            onClick={handleExport}
+            className="text-sm border rounded-lg px-3 py-2 bg-white hover:bg-gray-50"
+            title="Exporter tous les blocs en JSON"
+          >
+            Exporter JSON
+          </button>
+          <button
+            type="button"
+            onClick={handleImportClick}
+            className="text-sm border rounded-lg px-3 py-2 bg-white hover:bg-gray-50"
+            title="Importer des blocs depuis un JSON"
+          >
+            Importer JSON
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={handleImportFile}
+          />
+
+          <h1 className="text-2xl font-semibold ml-2">Blocs</h1>
+        </div>
+
         <button
           type="button"
           onClick={() => setConfirmOpen(true)}
@@ -224,6 +620,17 @@ export default function BlocksPage() {
                   try {
                     try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch {}
                     await clearAll();
+                    // vide caches d’analyse
+                    try {
+                      if (blocks) {
+                        Object.keys(blocks).forEach((id) => {
+                          localStorage.removeItem(`gaps_cache_${id}`);
+                        });
+                      }
+                    } catch {}
+                    setChecklists({});
+                    setRelances({});
+                    setLastAnalysisAt(null);
                     setConfirmOpen(false);
                   } finally {
                     setBusyReset(false);
@@ -247,12 +654,12 @@ export default function BlocksPage() {
         <div className="text-xs uppercase tracking-wide text-gray-500">Sélection</div>
         <select
           className="border rounded p-2 text-sm"
-          value={active?.id ?? ""}
+          value={(active as any)?.id ?? ""}
           onChange={(e) => setActiveId(e.target.value)}
         >
           {list.map((b: Block) => (
-            <option key={b.id} value={b.id}>
-              {b.title}
+            <option key={(b as any).id} value={(b as any).id}>
+              {(b as any).title}
             </option>
           ))}
         </select>
@@ -276,12 +683,67 @@ export default function BlocksPage() {
                 onClick={async () => {
                   const t = (titleDraft || "").trim();
                   if (!t || t === active.title) return;
-                  await renameBlock(active.id, t);
+                  await renameBlock((active as any).id, t);
                 }}
               >
                 Renommer
               </button>
             </div>
+          </section>
+
+          {/* Objectifs du bloc (Agent de complétude) */}
+          <section className="space-y-2 border rounded-xl p-4 bg-white">
+            <div className="flex items-center justify-between">
+              <div className="text-xs uppercase tracking-wide text-gray-500">
+                Objectifs du bloc
+              </div>
+              <div className="flex items-center gap-4">
+                {lastAnalysisAt && (
+                  <div className="text-[11px] text-gray-400">
+                    analysé le {new Date(lastAnalysisAt).toLocaleString()}
+                  </div>
+                )}
+                <button
+                  className="px-3 py-2 border rounded text-sm hover:bg-gray-50"
+                  onClick={analyzeActiveNow}
+                  disabled={analyzing}
+                >
+                  {analyzing ? "Analyse en cours…" : "Analyser maintenant"}
+                </button>
+                {/* ★ Jauge de complétude */}
+                <div className="hidden sm:flex flex-col items-end gap-1 min-w-[160px]">
+                  <div className="text-xs text-gray-500">
+                    Complétude&nbsp;: <span className="font-medium">{progressView.pct}%</span>
+                    {progressView.total > 0 && (
+                      <span className="text-gray-400"> &nbsp;({progressView.present}/{progressView.total})</span>
+                    )}
+                  </div>
+                  <div className="w-full h-2 rounded bg-gray-100 overflow-hidden border border-gray-200">
+                    <div
+                      className="h-2 rounded bg-indigo-500 transition-[width] duration-300"
+                      style={{ width: `${Math.min(100, Math.max(0, progressView.pct))}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+            <ChecklistChipsLocal blockId={(active as any).id} checklist={activeChecklist} />
+
+            {Array.isArray(activeRelances) && activeRelances.length > 0 && (
+              <div className="mt-3">
+                <div className="text-xs uppercase tracking-wide text-gray-500">Relances suggérées</div>
+                <ul className="mt-1 list-disc list-inside text-sm text-gray-700">
+                  {activeRelances.map((r: any, i: number) => (
+                    <li key={i}>
+                      <span className="font-medium">{r?.question || "…"} </span>
+                      <span className="text-xs text-gray-500">
+                        {r?.slotId ? `(${r.slotId})` : ""} {typeof r?.priority === "number" ? `• prio ${r.priority}` : ""}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </section>
 
           {/* Résumé (IA) */}
@@ -330,7 +792,7 @@ export default function BlocksPage() {
                       const txt = await summarizeBlockLLM(active);
                       if (typeof txt === "string") {
                         summaryMgr.reset(txt);
-                        await setSummary(active.id, txt);
+                        await setSummary((active as any).id, txt);
                       }
                     } catch {}
                   }}

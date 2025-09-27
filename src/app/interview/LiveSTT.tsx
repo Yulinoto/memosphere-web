@@ -1,26 +1,19 @@
+// src/app/interview/LiveSTT.tsx
 "use client";
 
 import { useEffect, useRef, useState } from "react";
 
 type Props = {
-  onPartial: (text: string) => void;
-  onFinal: (text: string) => void;
-  setStatus: (s: string) => void;
+  onPartial: (t: string) => void;
+  onFinal: (t: string) => void | Promise<void>;
+  setStatus: React.Dispatch<React.SetStateAction<string>>;
   onStart?: () => void;
   onStop?: () => void;
+  /** Optionnel : callback en cas d’erreur "fatale" du STT navigateur */
+  onFatal?: (why: string) => void;
   buttonLabel?: string;
-
-  /** Mains libres: reconnexion auto, pas besoin de recliquer */
-  auto?: boolean;
-  /** Langue (par défaut fr-FR) */
-  lang?: string;
-  /** Relance après fin (ms) en auto */
-  autoRestartDelayMs?: number;
+  disabled?: boolean;
 };
-
-type WebkitSpeechRecognition = typeof window extends any
-  ? any
-  : never;
 
 export default function LiveSTT({
   onPartial,
@@ -28,165 +21,95 @@ export default function LiveSTT({
   setStatus,
   onStart,
   onStop,
-  buttonLabel = "Voix (navigateur)",
-  auto = false,
-  lang = "fr-FR",
-  autoRestartDelayMs = 250
+  onFatal,
+  buttonLabel = "Parler (navigateur)",
+  disabled
 }: Props) {
-  const recRef = useRef<WebkitSpeechRecognition | null>(null);
-  const [supported, setSupported] = useState(false);
-  const [recognizing, setRecognizing] = useState(false);
-  const [permissionAsked, setPermissionAsked] = useState(false); // pour la 1re activation
+  const [listening, setListening] = useState(false);
+  const recogRef = useRef<SpeechRecognition | null>(null);
 
-  // Init / feature detection
   useEffect(() => {
-    const W = window as any;
-    if ("webkitSpeechRecognition" in W) {
-      setSupported(true);
-    } else {
-      setSupported(false);
-      setStatus("Reconnaissance vocale non supportée (essayez Chrome/Edge).");
+    return () => {
+      try {
+        recogRef.current?.stop();
+        // @ts-expect-error vendor prefix
+        recogRef.current?.abort?.();
+      } catch {}
+      recogRef.current = null;
+    };
+  }, []);
+
+  const start = () => {
+    // @ts-expect-error webkit prefix for Chrome
+    const SR: typeof SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setStatus("STT navigateur indisponible");
+      onFatal?.("no_speech_recognition");
+      return;
     }
-  }, [setStatus]);
 
-  const attachHandlers = (rec: any) => {
-    rec.onstart = () => {
-      setRecognizing(true);
-      setStatus("J’écoute…");
-      onStart?.();
-    };
-    rec.onerror = (evt: any) => {
-      const err = evt?.error;
-      // Quelques erreurs fréquentes : "no-speech", "audio-capture", "not-allowed"
-      if (err === "not-allowed" || err === "service-not-allowed") {
-        setStatus("Permission micro refusée.");
-      } else if (err === "no-speech") {
-        setStatus("Pas de voix détectée.");
-      } else {
-        setStatus(`Erreur STT: ${err || "inconnue"}`);
-      }
-    };
-    rec.onend = () => {
-      setRecognizing(false);
-      onStop?.();
-      if (auto) {
-        // Relance douce
-        setTimeout(() => {
-          tryStart();
-        }, autoRestartDelayMs);
-      } else {
-        setStatus("Prêt.");
-      }
-    };
-    rec.onresult = (evt: any) => {
-      let interim = "";
-      let finalText = "";
+    try {
+      const recog = new SR();
+      recog.lang = "fr-FR";
+      recog.interimResults = true;
+      recog.continuous = true;
 
-      for (let i = evt.resultIndex; i < evt.results.length; i++) {
-        const res = evt.results[i];
-        if (res.isFinal) {
-          finalText += res[0].transcript;
-        } else {
-          interim += res[0].transcript;
+      recog.onstart = () => {
+        setListening(true);
+        setStatus("Écoute en cours…");
+        onStart?.();
+      };
+
+      recog.onerror = (ev: any) => {
+        const code = String(ev?.error || "unknown");
+        setStatus(`Erreur STT (${code})`);
+        onFatal?.(code);
+      };
+
+      recog.onresult = (ev: SpeechRecognitionEvent) => {
+        let interim = "";
+        let final = "";
+        for (let i = ev.resultIndex; i < ev.results.length; i++) {
+          const res = ev.results[i];
+          const txt = res[0]?.transcript ?? "";
+          if (res.isFinal) final += txt;
+          else interim += txt;
         }
-      }
+        if (interim.trim()) onPartial(interim);
+        if (final.trim()) onFinal(final);
+      };
 
-      // Affichage du partiel
-      onPartial(interim.trim());
+      recog.onend = () => {
+        setListening(false);
+        setStatus("Prêt.");
+        onStop?.();
+      };
 
-      // À chaque finale, on pousse
-      if (finalText.trim()) {
-        onFinal(finalText.trim());
-        onPartial(""); // nettoie l'interim
-        // En mode auto + continuous, le moteur reste ouvert
-        // On laisse tourner (le onend relancera si besoin)
-      }
-    };
-  };
-
-  const createRecognizer = () => {
-    const W = window as any;
-    const rec = new W.webkitSpeechRecognition();
-    rec.continuous = true;         // écoute continue
-    rec.interimResults = true;     // résultats partiels "en direct"
-    rec.lang = lang;
-    attachHandlers(rec);
-    recRef.current = rec;
-    return rec;
-  };
-
-  const tryStart = async () => {
-    if (!supported) return;
-    // Si un ancien instance existe, on s’assure qu’elle est stoppée
-    try {
-      recRef.current?.stop();
-    } catch {}
-
-    const rec = recRef.current ?? createRecognizer();
-
-    try {
-      rec.start(); // peut throw si pas d'interaction préalable
-      setPermissionAsked(true);
+      recogRef.current = recog;
+      recog.start();
     } catch (e: any) {
-      // Autoplay/permissions: il faut un clic utilisateur initial
-      // On laisse un statut explicite pour guider l’utilisateur
-      if (e?.message?.includes("start")) {
-        setStatus("Clique sur le bouton pour activer le micro.");
-      } else {
-        setStatus("Impossible de démarrer la reconnaissance (autorisation ?).");
-      }
+      setStatus("Impossible de démarrer le STT.");
+      onFatal?.("start_failed");
     }
   };
 
   const stop = () => {
     try {
-      recRef.current?.stop();
+      recogRef.current?.stop();
+      // @ts-expect-error vendor prefix
+      recogRef.current?.abort?.();
     } catch {}
+    recogRef.current = null;
   };
 
-  // Effet: mode auto => démarrer si possible
-  useEffect(() => {
-    if (!auto) return;
-    // Si l’utilisateur n’a jamais autorisé le micro, il faudra un clic.
-    if (!permissionAsked) return;
-    if (!recognizing) {
-      tryStart();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auto]);
-
-  // Cleanup
-  useEffect(() => {
-    return () => {
-      try {
-        recRef.current?.stop();
-      } catch {}
-      recRef.current = null;
-    };
-  }, []);
-
   return (
-    <div className="flex items-center gap-2">
-      <button
-        className={`px-3 py-2 border rounded text-sm ${recognizing ? "bg-red-50" : "hover:bg-gray-50"}`}
-        onClick={() => {
-          if (!supported) return;
-          if (recognizing) {
-            stop();
-          } else {
-            tryStart();
-          }
-        }}
-        title={recognizing ? "Arrêter" : "Activer le micro"}
-      >
-        {recognizing ? "■ Stop" : `🎙️ ${buttonLabel}`}
-      </button>
-
-      {auto ? (
-        <span className="text-xs text-gray-600">Mains libres activé</span>
-      ) : (
-        <span className="text-xs text-gray-500">Cliquer pour parler</span>
-      )}
-    </div>
+    <button
+      className={`px-3 py-2 border rounded text-sm ${listening ? "bg-red-50" : "hover:bg-gray-50"}`}
+      onClick={() => (listening ? stop() : start())}
+      disabled={disabled}
+      title={listening ? "Arrêter" : "Démarrer"}
+    >
+      {listening ? "■ Stop" : (buttonLabel || "Parler (navigateur)")}
+    </button>
   );
 }

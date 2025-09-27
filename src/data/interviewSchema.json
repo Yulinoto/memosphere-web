@@ -1,0 +1,128 @@
+{
+  "identite": {
+    "goal": "Collecter les informations d’identité de base pour raconter l’origine et le cadre familial à la naissance.",
+    "must_have": [
+      "Nom et prénom",
+      "Surnoms éventuels",
+      "Date de naissance",
+      "Lieu de naissance",
+      "Composition de la famille proche à la naissance"
+    ],
+    "good_to_have": [
+      "Origine du prénom",
+      "Contexte de la naissance (ville, hôpital, ambiance)",
+      "Petite anecdote liée au prénom ou à la naissance"
+    ],
+    "style": "Chaud, simple, conversationnel, une seule question courte à la fois."
+  },
+  "enfance": {
+    "goal": "Décrire les premières années : maison d’enfance, école primaire, amis, jeux, souvenirs marquants.",
+    "must_have": [
+      "Maison ou lieu principal de l’enfance",
+      "École primaire",
+      "Amis proches d’enfance",
+      "Souvenir marquant",
+      "Relation avec parents/fratrie (au moins un élément concret)"
+    ],
+    "good_to_have": [
+      "Chambre d’enfant (description)",
+      "Jeux/favoris",
+      "Un adulte marquant (instituteur, voisin, etc.)"
+    ],
+    "style": "Chaud, concret, avec des images (son, odeur, couleurs), question courte."
+  },
+  "adolescence": {
+    "goal": "Explorer passions, moments charnières, relations amicales/affectives, identité en construction.",
+    "must_have": [
+      "Une passion/activité prenante",
+      "Un moment charnière au collège/lycée",
+      "Un ami important avec une anecdote",
+      "Un défi ou une difficulté traversée"
+    ],
+    "good_to_have": [
+      "Premier amour / première bande",
+      "Projets/ambitions à cet âge"
+    ],
+    "style": "Direct, bienveillant, pas intrusif, une question à la fois."
+  },
+  "debuts_adultes": {
+    "goal": "Raconter l’entrée dans la vie adulte : études, premier boulot, choix orientant la suite.",
+    "must_have": [
+      "Études ou premier emploi",
+      "Choix important qui a orienté la vie",
+      "Première installation (ville/appart)",
+      "Un premier ‘grand pas’ (voyage, départ, etc.)"
+    ],
+    "good_to_have": [
+      "Une personne qui a aidé à ce moment",
+      "Une difficulté et comment elle a été gérée"
+    ],
+    "style": "Concret, orienté décisions, question courte."
+  },
+  "metier": {
+    "goal": "Mettre au clair la vocation, les fiertés et épreuves, ce qui est transmis aux autres.",
+    "must_have": [
+      "Déclic pour le métier/vocation",
+      "Une fierté professionnelle",
+      "Une épreuve/échec marquant",
+      "Ce que l’on aime transmettre"
+    ],
+    "good_to_have": [
+      "Valeurs au travail",
+      "Un moment de changement (reconversion, promotion, etc.)"
+    ],
+    "style": "Clair, positif, humble, une question courte."
+  },
+  "valeurs": {
+    "goal": "Exprimer les valeurs et croyances actuelles et d’où elles viennent.",
+    "must_have": [
+      "Ce qui compte aujourd’hui",
+      "Une valeur héritée (ou rejetée) de la famille",
+      "Une leçon tirée d’une épreuve"
+    ],
+    "good_to_have": [
+      "Valeurs guidant des décisions concrètes",
+      "Changement de croyances au fil du temps"
+    ],
+    "style": "Calme, introspectif, sans jugement."
+  },
+  "anecdotes": {
+    "goal": "Récolter des histoires courtes et marquantes.",
+    "must_have": [
+      "Une histoire courte (drôle/marquante)",
+      "Un raté devenu bon souvenir",
+      "Un moment improbable/inattendu"
+    ],
+    "good_to_have": [
+      "Le contexte: qui, où, quand",
+      "Ce que ça t’a appris"
+    ],
+    "style": "Vivant, accrocheur, centré sur la scène."
+  },
+  "lieux": {
+    "goal": "Lister et décrire les lieux marquants et leur charge émotionnelle.",
+    "must_have": [
+      "Un lieu qui revient souvent en tête (description sensorielle)",
+      "Un voyage transformant",
+      "Un endroit où retourner (pourquoi)"
+    ],
+    "good_to_have": [
+      "Personnes associées à ces lieux",
+      "Moments-clés vécus là-bas"
+    ],
+    "style": "Visuel, évocateur, court."
+  },
+  "heritage": {
+    "goal": "Formuler ce que l’on veut laisser/transmettre et un message aux proches.",
+    "must_have": [
+      "Message aux proches",
+      "Ce qu’on aimerait laisser/transmettre",
+      "Un conseil au ‘moi’ plus jeune"
+    ],
+    "good_to_have": [
+      "Valeurs à transmettre et à qui",
+      "Un souhait/voeu pour l’avenir"
+    ],
+    "style": "Simple, chaleureux, authentique."
+  }
+}
