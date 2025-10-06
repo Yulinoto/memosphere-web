@@ -2,18 +2,47 @@
   "identite": {
     "goal": "Collecter les informations d’identité de base pour raconter l’origine et le cadre familial à la naissance.",
     "must_have": [
-      "Nom et prénom",
-      "Surnoms éventuels",
+      "Prénom",
+      "Nom de famille",
       "Date de naissance",
       "Lieu de naissance",
       "Composition de la famille proche à la naissance"
     ],
     "good_to_have": [
-      "Origine du prénom",
+      "Surnoms éventuels (et origine)",
       "Contexte de la naissance (ville, hôpital, ambiance)",
       "Petite anecdote liée au prénom ou à la naissance"
     ],
-    "style": "Chaud, simple, conversationnel, une seule question courte à la fois."
+    "guidelines": [
+      "Tutoiement, ton chaleureux, simple.",
+      "Toujours poser UNE question concrète (≤ 20 mots).",
+      "Prioriser d’abord les champs manquants.",
+      "Éviter les demandes vagues (« infos complètes », « plus d’informations »).",
+      "Si prénom et nom sont fournis, relancer sur date puis lieu puis famille.",
+      "Si l’utilisateur donne « prénom + nom » en une fois, extraire et remplir les deux slots."
+    ],
+    "pinnedQuestions": [
+      "Quel est ton prénom ?",
+      "Et ton nom de famille ?",
+      "As-tu un surnom ?",
+      "Quelle est ta date de naissance ?",
+      "Où es-tu né·e (ville, pays) ?",
+      "Qui composait ta famille proche à ta naissance ?",
+      "Si tu préfères, donne-moi prénom + nom d’un coup."
+    ],
+    "style": "Chaud, simple, conversationnel, une seule question courte à la fois.",
+    "slots": [
+      { "id": "prenom", "label": "Prénom", "weight": 2 },
+      { "id": "nom", "label": "Nom de famille", "weight": 2 },
+
+      
+      { "id": "nom_prenom", "label": "Nom et prénom (héritage – auto-split)", "weight": 0.1 },
+
+      { "id": "date_naissance", "label": "Date de naissance", "weight": 2 },
+      { "id": "lieu_naissance", "label": "Lieu de naissance", "weight": 1 },
+      { "id": "famille_proche", "label": "Composition de la famille proche", "weight": 1 },
+      { "id": "surnoms", "label": "Surnoms éventuels", "weight": 0.5 }
+    ]
   },
   "enfance": {
     "goal": "Décrire les premières années : maison d’enfance, école primaire, amis, jeux, souvenirs marquants.",
@@ -26,8 +55,21 @@
     ],
     "good_to_have": [
       "Chambre d’enfant (description)",
-      "Jeux/favoris",
+      "Jeux favoris",
       "Un adulte marquant (instituteur, voisin, etc.)"
+    ],
+    "guidelines": [
+      "Questions courtes, imagées (sons, odeurs, couleurs).",
+      "Cherche des détails concrets (qui, où, quand).",
+      "Relance si un élément manque à la scène.",
+      "Ton bienveillant, pas intrusif."
+    ],
+    "pinnedQuestions": [
+      "Où as-tu grandi (maison, quartier) ?",
+      "À quelle école primaire allais-tu ?",
+      "Qui étaient tes amis proches d’enfance ?",
+      "Raconte un souvenir marquant d’enfance.",
+      "Comment étaient tes relations avec tes parents ou ta fratrie ?"
     ],
     "style": "Chaud, concret, avec des images (son, odeur, couleurs), question courte."
   },
@@ -43,6 +85,17 @@
       "Premier amour / première bande",
       "Projets/ambitions à cet âge"
     ],
+    "guidelines": [
+      "Ton direct, bienveillant.",
+      "Évite le jugement, pose une seule question par étape.",
+      "Cherche l’ancrage (où, quand, avec qui)."
+    ],
+    "pinnedQuestions": [
+      "Quelle passion te prenait le plus de temps à l’adolescence ?",
+      "Un moment charnière au collège/lycée ?",
+      "Parle d’un ami important et d’une anecdote avec lui/elle.",
+      "Quel défi as-tu dû traverser à cette époque ?"
+    ],
     "style": "Direct, bienveillant, pas intrusif, une question à la fois."
   },
   "debuts_adultes": {
@@ -56,6 +109,17 @@
     "good_to_have": [
       "Une personne qui a aidé à ce moment",
       "Une difficulté et comment elle a été gérée"
+    ],
+    "guidelines": [
+      "Questions orientées décisions / étapes.",
+      "Demande un exemple précis.",
+      "Reste concis et factuel, ton chaleureux."
+    ],
+    "pinnedQuestions": [
+      "Qu’as-tu fait après le lycée (études ou premier job) ?",
+      "Quel choix a vraiment orienté la suite ?",
+      "Où t’es-tu installé pour la première fois ?",
+      "Un premier « grand pas » (voyage, départ…) ?"
     ],
     "style": "Concret, orienté décisions, question courte."
   },
@@ -71,6 +135,17 @@
       "Valeurs au travail",
       "Un moment de changement (reconversion, promotion, etc.)"
     ],
+    "guidelines": [
+      "Invite à un exemple précis (projet, personne, résultat).",
+      "Une question à la fois, ≤ 20 mots.",
+      "Équilibre positif/humilité."
+    ],
+    "pinnedQuestions": [
+      "D’où vient le déclic pour ton métier/vocation ?",
+      "De quoi es-tu le plus fier au travail ?",
+      "Quelle épreuve pro t’a marqué·e ?",
+      "Qu’aimes-tu transmettre dans ton métier ?"
+    ],
     "style": "Clair, positif, humble, une question courte."
   },
   "valeurs": {
@@ -83,6 +158,16 @@
     "good_to_have": [
       "Valeurs guidant des décisions concrètes",
       "Changement de croyances au fil du temps"
+    ],
+    "guidelines": [
+      "Ton calme, introspectif.",
+      "Toujours ancrer dans un exemple concret.",
+      "Évite les généralités creuses."
+    ],
+    "pinnedQuestions": [
+      "Qu’est-ce qui compte le plus pour toi aujourd’hui ?",
+      "Une valeur héritée (ou rejetée) de ta famille ?",
+      "Quelle leçon as-tu tirée d’une épreuve ?"
     ],
     "style": "Calme, introspectif, sans jugement."
   },
@@ -97,6 +182,16 @@
       "Le contexte: qui, où, quand",
       "Ce que ça t’a appris"
     ],
+    "guidelines": [
+      "Va droit à la scène (qui, où, quand).",
+      "Demande une seule histoire à la fois.",
+      "Relance sur le détail le plus vivant."
+    ],
+    "pinnedQuestions": [
+      "Raconte une petite histoire marquante.",
+      "Un raté devenu bon souvenir ?",
+      "Un moment improbable/inattendu que tu as vécu ?"
+    ],
     "style": "Vivant, accrocheur, centré sur la scène."
   },
   "lieux": {
@@ -110,8 +205,34 @@
       "Personnes associées à ces lieux",
       "Moments-clés vécus là-bas"
     ],
+    "guidelines": [
+      "Favorise la description sensorielle (sons, odeurs, lumières).",
+      "Demande une image précise, pas une liste.",
+      "Relance par « qui était là », « quel moment »."
+    ],
+    "pinnedQuestions": [
+      "Décris un lieu qui revient souvent en tête.",
+      "Un voyage qui t’a transformé·e ?",
+      "Un endroit où tu voudrais retourner, pourquoi ?"
+    ],
     "style": "Visuel, évocateur, court."
   },
+  "theme_central": {
+  "slots": [],
+  "must_have": [
+    "Titre du thème/évènement",
+    "Période concernée",
+    "Lieu principal",
+    "Personnes clés",
+    "Résumé (3–5 phrases)"
+  ],
+  "good_to_have": [
+    "Scène pivot emblématique",
+    "Motif récurrent (objet/symbole/lieu/son)",
+    "Avant → Après (ce qui a changé)",
+    "Archives disponibles (liste textuelle : type, intitulé, où la trouver, lien au thème)"
+  ]
+},
   "heritage": {
     "goal": "Formuler ce que l’on veut laisser/transmettre et un message aux proches.",
     "must_have": [
@@ -122,6 +243,16 @@
     "good_to_have": [
       "Valeurs à transmettre et à qui",
       "Un souhait/voeu pour l’avenir"
+    ],
+    "guidelines": [
+      "Ton simple, sincère, authentique.",
+      "Invite à s’adresser à quelqu’un (tu/vous).",
+      "Une question claire et courte."
+    ],
+    "pinnedQuestions": [
+      "Quel message aimerais-tu laisser à tes proches ?",
+      "Qu’aimerais-tu transmettre ?",
+      "Quel conseil donnerais-tu à ton ‘moi’ plus jeune ?"
     ],
     "style": "Simple, chaleureux, authentique."
   }

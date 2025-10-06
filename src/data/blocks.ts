@@ -1,4 +1,3 @@
-// src/data/blocks.ts
 export type Entry =
   | { type: "texte"; q: string; a: string; ts: number }
   | { type: "audio"; q: string; a: string; ts: number; audioUrl?: string }
@@ -15,6 +14,13 @@ export type ChecklistEntry = {
   notes?: string;
 };
 
+/** Valeur canonique décidée pour un slot (ex: nom_prenom) */
+export type ResolvedValue = {
+  value: string;
+  source?: string; // "conflict_resolution" | "confirmation_user" | ...
+  at?: number;     // timestamp
+};
+
 export type Block = {
   id: string;                     // ex: "identite"
   title: string;                  // ex: "Identité"
@@ -24,6 +30,23 @@ export type Block = {
   content?: string;               // récit brut (mémoire)
   pinnedQuestions?: string[];     // questions fixes (interview guidée)
   checklist?: Record<string, ChecklistEntry>; // contrôleur de complétude
+   order?: number;
+
+  // --- Agent d'incohérences (optionnel) ---
+  conflicts?: Array<{
+    id: string; // hash léger (type+extraits) pour dédoublonner
+    type: "fact_conflict" | "temporal_conflict" | "soft_conflict";
+    slotId?: string;
+    severity: "low" | "med" | "high";
+    explanation: string;           // court, lisible humain
+    relances?: string[];           // 0..2 relances pour lever l’ambiguïté
+    evidenceEntryIdx?: number[];   // indices des entries concernées
+    createdAt: number;
+  }>;
+  conflictsUpdatedAt?: number; // timestamp dernière analyse
+
+  /** Valeurs canoniques par slot (ex: { nom_prenom: { value: "Jean Dupont" } }) */
+  resolved?: Record<string, ResolvedValue>;
 };
 
 export type BlocksState = Record<string, Block>;
@@ -115,6 +138,23 @@ export const DEFAULT_BLOCKS: BlocksState = {
       "Un lieu qui te revient souvent en tête (décris-le) ?",
       "Un voyage transformant ?",
       "Un endroit où tu aimerais retourner, pourquoi ?"
+    ]
+  },
+    theme_central: {
+    id: "theme_central",
+    title: "Thème central / Évènement pivot",
+    progress: 0,
+    entries: [],
+    pinnedQuestions: [
+      "S’il fallait un titre pour ton livre, ce serait quoi, et pourquoi ?",
+      "Entre quelles années se déroule l’essentiel de cette histoire ?",
+      "Où se passe le cœur de cette histoire ?",
+      "Qui sont les protagonistes essentiels ?",
+      "Raconte ce thème/évènement en 3 à 5 phrases.",
+      "Décris la scène pivot qui résume le mieux ce thème.",
+      "Y a-t-il un objet/symbole/lieu/son qui revient souvent ? Pourquoi compte-t-il ?",
+      "Qu’est-ce qui change pour toi : avant → après ?",
+      "Liste (texte uniquement) des archives utiles : type, intitulé, où la trouver, lien au thème."
     ]
   },
   heritage: {

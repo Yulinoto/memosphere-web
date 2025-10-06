@@ -53,6 +53,7 @@ export default function LiveSTT({
       recog.lang = "fr-FR";
       recog.interimResults = true;
       recog.continuous = true;
+      recog.maxAlternatives = 1;
 
       recog.onstart = () => {
         setListening(true);

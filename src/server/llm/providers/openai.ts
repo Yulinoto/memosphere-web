@@ -1,4 +1,6 @@
 // src/server/llm/providers/openai.ts
+
+
 import OpenAI from "openai";
 import type {
   LLM,
@@ -6,6 +8,8 @@ import type {
   ProbeInput, ProbeOutput,
   VariantsInput, VariantsOutput,
 } from "../types";
+import type { Entry, ResolvedValue } from "@/data/blocks";
+import type { ChatCompletionMessageParam } from "openai/resources/index.mjs";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MODEL_FAST = process.env.OPENAI_FAST_MODEL || "gpt-4o-mini";
@@ -15,10 +19,14 @@ function langName(lang?: "fr" | "en") {
 }
 function styleHint(s?: "sobre" | "journal" | "narratif") {
   switch (s) {
-    case "journal":  return "Tone: intimate journal, calm, first person.";
+    case "journal": return "Tone: intimate journal, calm, first person.";
     case "narratif": return "Tone: light narrative, fluid transitions, still concise.";
-    default:         return "Tone: neutral and concise.";
+    default: return "Tone: neutral and concise.";
   }
+}
+
+function isTexteEntry(entry: Entry): entry is Extract<Entry, { type: "texte"; q: string; a: string }> {
+  return entry.type === "texte";
 }
 
 export const openaiAdapter: LLM = {
@@ -92,4 +100,57 @@ Keep the same angle, simpler wording, <= 20 words. Return only the question.`;
     const alt = r.choices[0]?.message?.content?.trim() || question;
     return { altQuestion: alt.replace(/^\p{P}+/u, "").trim() };
   },
+
+  async extractResolvedFromEntries({
+    entries,
+    lang = "fr"
+  }: {
+    entries: Entry[];
+    lang?: "fr" | "en";
+  }): Promise<Record<string, ResolvedValue>> {
+    const content = entries
+      .filter(isTexteEntry)
+      .map((e) => `Q: ${e.q}\nA: ${e.a}`)
+      .join("\n\n");
+
+    const prompt = `Tu es un scribe intelligent qui analyse les questions et réponses d'un utilisateur.\n` +
+      `Tu dois extraire les informations importantes et structurées.\n` +
+      `Retourne uniquement un objet JSON de la forme suivante :\n` +
+      `{ slotId: { value: string, source: 'scribe', at: timestamp } }\n` +
+      `N'inclus que des infos claires, sans incertitude. Pas de phrase incomplète ou bruit. Langue: ${lang}.`;
+
+    const messages: ChatCompletionMessageParam[] = [
+      { role: "system", content: prompt },
+      { role: "user", content },
+    ];
+
+    try {
+      const chat = await client.chat.completions.create({
+        model: MODEL_FAST,
+        messages,
+        temperature: 0.2,
+        response_format: { type: "json_object" }
+      });
+
+      const raw = chat.choices?.[0]?.message?.content;
+      const now = Date.now();
+      const parsed = JSON.parse(raw || "{}") as Record<string, any>;
+
+      const result: Record<string, ResolvedValue> = {};
+      for (const [slot, val] of Object.entries(parsed)) {
+        if (typeof val?.value === "string") {
+          result[slot] = {
+            value: val.value.trim(),
+            source: "scribe",
+            at: now
+          };
+        }
+      }
+
+      return result;
+    } catch (err) {
+      console.error("Erreur extractResolvedFromEntries:", err);
+      return {};
+    }
+  }
 };

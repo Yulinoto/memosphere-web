@@ -13,10 +13,13 @@ type GapResult = {
   error?: string;
 };
 
+const AGENT_OWNS = String(process.env.NEXT_PUBLIC_AGENT_OWNS_VALIDATION || "").toLowerCase() === "true";
+
 export function useCompleteness() {
   const cacheRef = useRef<Map<string, GapResult>>(new Map());
 
   const getLocalScore = useCallback((block: Block | null | undefined) => {
+    if (AGENT_OWNS) return 0; // neutralisé si l'agent gère
     if (!block) return 0;
     const spec: any = (schema as any)[block.id];
     if (!spec) return Math.min(100, Math.round((block.entries.length / 6) * 100));
@@ -28,7 +31,6 @@ export function useCompleteness() {
       .join("\n")
       .toLowerCase();
 
-    // Heuristique bête: matching naïf par mots-clés (à améliorer si tu veux)
     const hit = (label: string) => {
       const k = label.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
       return k.length ? k.some((w) => text.includes(w)) : false;
@@ -50,33 +52,53 @@ export function useCompleteness() {
       return cacheRef.current.get(key)!;
     }
 
-    const payload = {
-      blockId,
-      entries: entries
-        .map((e) => ({
-          q: "q" in e ? (e as any).q : "",
-          a: "a" in e ? (e as any).a : ""
-        })),
-      lastAnswer: lastAnswer || ""
-    };
+    if (AGENT_OWNS) {
+      // On passe par /api/llm/gaps qui délègue à l'agent
+      try {
+        const res = await fetch("/api/llm/gaps", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            blockId,
+            entries: entries.map((e) => ({ q: (e as any).q || "", a: (e as any).a || "" })),
+            lastAnswer: lastAnswer || ""
+          })
+        });
+        const json = await res.json().catch(() => ({}));
+        const out: GapResult = {
+          ok: !!json?.ok,
+          score: typeof json?.score === "number" ? json.score : 0,
+          missing: Array.isArray(json?.missing) ? json.missing : [],
+          follow_up: typeof json?.follow_up === "string" ? json.follow_up : "",
+          error: json?.error
+        };
+        cacheRef.current.set(key, out);
+        return out;
+      } catch (e: any) {
+        const out: GapResult = { ok: false, error: e?.message || "Erreur réseau gaps" };
+        cacheRef.current.set(key, out);
+        return out;
+      }
+    }
 
+    // Chemin legacy (si jamais tu veux tester sans agent)
     try {
       const res = await fetch("/api/llm/gaps", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({
+          blockId,
+          entries: entries.map((e) => ({ q: (e as any).q || "", a: (e as any).a || "" })),
+          lastAnswer: lastAnswer || ""
+        })
       });
       const json = await res.json().catch(() => ({}));
-      if (!res.ok || !json?.ok) {
-        const out: GapResult = { ok: false, error: json?.error || "Erreur gaps" };
-        cacheRef.current.set(key, out);
-        return out;
-      }
       const out: GapResult = {
-        ok: true,
-        score: json.score ?? 0,
-        missing: Array.isArray(json.missing) ? json.missing : [],
-        follow_up: typeof json.follow_up === "string" ? json.follow_up : ""
+        ok: !!json?.ok,
+        score: typeof json?.score === "number" ? json.score : 0,
+        missing: Array.isArray(json?.missing) ? json.missing : [],
+        follow_up: typeof json?.follow_up === "string" ? json.follow_up : "",
+        error: json?.error
       };
       cacheRef.current.set(key, out);
       return out;

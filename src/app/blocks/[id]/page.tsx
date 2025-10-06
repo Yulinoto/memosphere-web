@@ -5,6 +5,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useBlocks } from "@/hooks/useBlocks";
 import type { Entry } from "@/data/blocks";
+import Link from "next/link";
+
 
 /**
  * Page bloc :
@@ -46,6 +48,7 @@ export default function BlockViewPage() {
     if (!blocks || !id) return null;
     return blocks[id] ?? null;
   }, [blocks, id]);
+
 
   /* ---------------------------
      Helpers déclarés AVANT useEffect (pour éviter ReferenceError)
@@ -346,6 +349,13 @@ export default function BlockViewPage() {
               onChange={(e) => setAnswer(e.target.value)}
             />
             <div className="flex gap-2">
+              <Link
+  href={`/interview?block=${encodeURIComponent(id)}`}
+  className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+  title="Relancer une interview ciblée pour ce bloc"
+>
+  Interviewer ce bloc
+</Link>
               <button className="px-3 py-2 border rounded hover:bg-gray-50" onClick={handleAddText}>
                 Ajouter la réponse
               </button>

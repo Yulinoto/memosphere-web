@@ -1,8 +1,9 @@
+// src/app/api/llm/variants/route.ts
 import { NextResponse } from "next/server";
 import { getLLM } from "@/server/llm";
 import type { VariantsInput } from "@/server/llm/types";
 
-export const runtime = "edge";
+export const runtime = "nodejs"; // aligne le runtime
 
 export async function POST(req: Request) {
   try {
@@ -11,9 +12,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Missing 'question'" }, { status: 400 });
     }
     const llm = getLLM();
-    const out = await (llm.variants
-      ? llm.variants({ question: body.question, blockId: body.blockId, lang: body.lang ?? "fr" })
-      : Promise.resolve({ altQuestion: body.question }));
+
+    const out = llm.variants
+      ? await llm.variants({
+          question: body.question,
+          blockId: body.blockId,
+          lang: body.lang ?? "fr",
+        })
+      : { altQuestion: body.question };
 
     return NextResponse.json({ ok: true, ...out });
   } catch (e: any) {

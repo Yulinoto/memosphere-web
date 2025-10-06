@@ -54,6 +54,7 @@ export default function DeepgramSTT({
       smart_format: true,
       interim_results: true,
       vad_events: true,
+      endpointing: 2000,
     });
 
     conn.on(LiveTranscriptionEvents.Open, async () => {

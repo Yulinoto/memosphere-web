@@ -1,11 +1,13 @@
 // src/server/llm/types.ts
+import type { Entry, ResolvedValue } from "@/data/blocks";
+
 export type RephraseInput = {
   text: string;
   blockId?: string;
   lang?: "fr" | "en";
-  maxSentences?: number; // 1..3 par défaut
-  style?: "sobre" | "journal" | "narratif"; // TON souhaité
-  removeFillers?: boolean;                  // Vider "euh/ben/bah..." etc.
+  maxSentences?: number;
+  style?: "sobre" | "journal" | "narratif";
+  removeFillers?: boolean;
 };
 
 export type RephraseOutput = { text: string };
@@ -28,4 +30,8 @@ export interface LLM {
   rephrase(input: RephraseInput): Promise<RephraseOutput>;
   probe?(input: ProbeInput): Promise<ProbeOutput>;
   variants?(input: VariantsInput): Promise<VariantsOutput>;
+  extractResolvedFromEntries?(params: {
+    entries: Entry[];
+    lang?: "fr" | "en";
+  }): Promise<Record<string, ResolvedValue>>;
 }

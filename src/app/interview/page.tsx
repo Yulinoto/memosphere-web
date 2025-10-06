@@ -1,32 +1,70 @@
-// src/app/interview/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useBlocks } from "@/hooks/useBlocks";
-import type { Entry } from "@/data/blocks";
+import type { Entry, Block } from "@/data/blocks";
 import DeepgramSTT from "./DeepgramSTT";
 import LiveSTT from "./LiveSTT";
 import schemaJson from "@/data/interviewSchema.json";
 import { useBetterTTS } from "@/hooks/useBetterTTS";
 
+type BlockWithOrder = { id: string; progress?: number; order?: number } & any;
+
+const ORDER: Record<string, number> = {
+  identite: 0,
+  enfance: 10,
+  adolescence: 20,
+  debuts_adultes: 30,
+  metier: 40,
+  valeurs: 50,
+  anecdotes: 60,
+  lieux: 70,
+  theme_central: 80,
+  heritage: 90,
+};
+
 type Mode = "voice" | "text";
 type MsgRole = "assistant" | "user" | "draft";
 type Message = { role: MsgRole; text: string; ts: number; key?: string };
+type PendingPayload = { text: string; blockId?: string; question?: string };
+type BlocksMap = Record<string, Block>;
 
-type PendingPayload = {
-  text: string;
-  blockId?: string;
-  question?: string;
-};
+// ===== Feature flag (agent SDK pilote) =====
+const AGENT_MODE = true;
 
 export default function InterviewPage() {
   const router = useRouter();
-  const { loading, blocks, addTextEntry } = useBlocks();
+  const searchParams = useSearchParams();
+
+  // --- hooks blocs
+  const _api = useBlocks() as any;
+  const loading: boolean = _api.loading;
+  const blocks: BlocksMap | null = _api.blocks ?? null;
+  const addTextEntry: (blockId: string, q: string, a: string) => Promise<void> = _api.addTextEntry;
+  const setResolved:
+    | undefined
+    | ((blockId: string, payload: Record<string, { value: string; source?: string }>) => Promise<void>) =
+    _api.setResolved;
 
   // ===== Liste blocs / sélection (mode libre) =====
-  const items = useMemo(() => (blocks ? Object.values(blocks) : []), [blocks]);
+  const items = useMemo(() => (blocks ? (Object.values(blocks) as any[]) : []), [blocks]);
+
+  // --- Tri fixe pour garder Identité en tête + ordre stable
+  const itemsSorted = useMemo(() => {
+    return items.slice().sort((a: BlockWithOrder, b: BlockWithOrder) => {
+      const oa = (a?.order ?? ORDER[a?.id] ?? 0);
+      const ob = (b?.order ?? ORDER[b?.id] ?? 0);
+      if (oa !== ob) return oa - ob;
+      return (a?.progress ?? 0) - (b?.progress ?? 0);
+    });
+  }, [items]);
+
   const [selectedId, setSelectedId] = useState<string>("");
+// --- contrôles "première question" ---
+const [firstQuestion, setFirstQuestion] = useState<string>(""); // texte à poser en 1er
+const firstQPrimedRef = useRef(false);                          // indique si on doit poser firstQuestion
+const firstQuestionSlotRef = useRef<string | null>(null);
 
   // ===== Parcours guidé =====
   const DEFAULT_ORDER = [
@@ -46,16 +84,16 @@ export default function InterviewPage() {
     DEFAULT_ORDER.filter((id) => !!blocks?.[id])
   );
   const [gIndex, setGIndex] = useState(0); // bloc
-  const [qIndex, setQIndex] = useState(0); // question index dans le bloc
+  const [qIndex, setQIndex] = useState(0); // index pinned
 
-  // Pré-sélection premier bloc en mode libre
+  // Pré-sélection 1er bloc (mode libre)
   useEffect(() => {
-    if (!loading && items.length && !selectedId && !guided) {
-      setSelectedId(items[0].id);
+    if (!loading && itemsSorted.length && !selectedId && !guided) {
+      setSelectedId(itemsSorted[0].id);
     }
-  }, [loading, items, selectedId, guided]);
+  }, [loading, itemsSorted, selectedId, guided]);
 
-  // Bloc actif selon mode
+  // Bloc actif
   const guidedBlockId = guided ? scriptOrder[gIndex] : null;
   const activeBlock = useMemo(() => {
     if (guided) {
@@ -69,7 +107,7 @@ export default function InterviewPage() {
   // ===== Mode (Voix / Texte) =====
   const [mode, setMode] = useState<Mode>("voice");
 
-  // ===== TTS (OpenAI via /api/tts + sélection de voix) =====
+  // ===== TTS =====
   const [ttsOn, setTtsOn] = useState(true);
   const [ttsVoice, setTtsVoice] = useState<string>(() => {
     if (typeof window === "undefined") return "alloy";
@@ -85,14 +123,11 @@ export default function InterviewPage() {
     localStorage.setItem("tts_on", ttsOn ? "1" : "0");
     if (!ttsOn) stopTTS();
   }, [ttsOn, stopTTS]);
-
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      localStorage.setItem("tts_voice", ttsVoice);
-    }
+    if (typeof window !== "undefined") localStorage.setItem("tts_voice", ttsVoice);
   }, [ttsVoice]);
 
-  // ===== STT (choix Deepgram pro / navigateur) =====
+  // ===== STT choix =====
   const [usePro, setUsePro] = useState(true);
   useEffect(() => {
     const saved = localStorage.getItem("stt_mode");
@@ -102,7 +137,7 @@ export default function InterviewPage() {
     localStorage.setItem("stt_mode", usePro ? "pro" : "browser");
   }, [usePro]);
 
-  // ===== Correction IA (reformulation) =====
+  // ===== Correction IA (scribe) =====
   const [aiOptIn, setAiOptIn] = useState(true);
   useEffect(() => {
     const v = localStorage.getItem("ai_optin");
@@ -112,7 +147,7 @@ export default function InterviewPage() {
     localStorage.setItem("ai_optin", aiOptIn ? "1" : "0");
   }, [aiOptIn]);
 
-  // ===== blockId fiable =====
+  // ===== blockId courant =====
   function getActiveBlockId(): string {
     if (guided) {
       const id = guidedBlockId ?? scriptOrder[gIndex];
@@ -120,9 +155,10 @@ export default function InterviewPage() {
     }
     return selectedId || "";
   }
+
   const blkIdReady = Boolean(activeBlock && getActiveBlockId());
 
-  // ===== Fallback question (pinned) =====
+  // ===== Fallback pinned question =====
   const nextQuestion = useMemo(() => {
     const p = activeBlock?.pinnedQuestions ?? [];
     if (!p.length) return "Raconte-moi un souvenir lié à ce thème.";
@@ -131,8 +167,8 @@ export default function InterviewPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeBlock?.id, guided, qIndex, activeBlock?.entries.length]);
 
-  // ===== Refs pour éviter closures périmées =====
-  const blocksRef = useRef(blocks);
+  // ===== Refs =====
+  const blocksRef = useRef<BlocksMap | null>(null);
   const questionRef = useRef(nextQuestion);
   const blockIdRef = useRef<string>(getActiveBlockId());
   const guidedRef = useRef(guided);
@@ -146,24 +182,213 @@ export default function InterviewPage() {
 
   // ===== Fil de conversation =====
   const [messages, setMessages] = useState<Message[]>([]);
+  const firstIAAskedRef = useRef(false);
+
+  // ===== Mode "chat libre" une fois la section finie =====
+  const [freeFlowBlocks, setFreeFlowBlocks] = useState<Record<string, boolean>>({});
+  const isFreeFlow = useMemo(() => {
+    const id = getActiveBlockId();
+    return !!(id && freeFlowBlocks[id]);
+  }, [freeFlowBlocks, guided, selectedId, activeBlock?.id]);
+  const enableFreeFlow = (blockId: string) => {
+    if (!blockId) return;
+    setFreeFlowBlocks((m) => ({ ...m, [blockId]: true }));
+  };
+
+  async function getFreeChatQuestion(blockId: string, lastAnswer?: string): Promise<string> {
+    try {
+      const res = await fetch("/api/llm/probe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lastText: (lastAnswer || "").trim() || "", blockId, lang: "fr" }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && json?.ok && typeof json.question === "string") {
+        return String(json.question).trim();
+      }
+    } catch {}
+    // Fallback: question plus ouverte
+    return "On a couvert l'essentiel ici. Un souvenir ou un point que tu voudrais approfondir ?";
+  }
+
+// === Mémoire des slots déjà demandés (session + persistance) ===
+const ASKED_SLOTS_KEY = "memosphere:askedSlots:v1";
+// structure: { [blockId]: Set<slotId> }
+const askedSlotsRef = useRef<Record<string, Set<string>>>({});
+
+useEffect(() => {
+  try {
+    const raw = typeof window !== "undefined" ? localStorage.getItem(ASKED_SLOTS_KEY) : null;
+    if (raw) {
+      const parsed: Record<string, string[]> = JSON.parse(raw);
+      const shaped: Record<string, Set<string>> = {};
+      for (const [k, arr] of Object.entries(parsed || {})) {
+        shaped[k] = new Set(arr || []);
+      }
+      askedSlotsRef.current = shaped;
+    }
+  } catch {
+    askedSlotsRef.current = {};
+  }
+}, []);
+
+function persistAskedSlots() {
+  try {
+    const plain: Record<string, string[]> = {};
+    for (const [k, s] of Object.entries(askedSlotsRef.current || {})) {
+      plain[k] = Array.from(s || []);
+    }
+    localStorage.setItem(ASKED_SLOTS_KEY, JSON.stringify(plain));
+  } catch {}
+}
+
+function markAsked(blockId: string | undefined, slotId: string | null | undefined) {
+  if (!blockId || !slotId) return;
+  if (!askedSlotsRef.current[blockId]) askedSlotsRef.current[blockId] = new Set();
+  askedSlotsRef.current[blockId].add(slotId);
+  persistAskedSlots();
+}
+
+function wasAsked(blockId: string | undefined, slotId: string | null | undefined) {
+  if (!blockId || !slotId) return false;
+  return !!askedSlotsRef.current[blockId]?.has(slotId);
+}
+
+function isSlotFilled(blockId: string | undefined, slotId: string) {
+  const b = blocksRef.current?.[blockId || ""];
+  const val = (b?.resolved?.[slotId]?.value ?? "") as string;
+  return String(val || "").trim().length > 0;
+}
+
+function missingSlotsFor(blockId: string | undefined): string[] {
+  if (!blockId) return [];
+  const b = blocksRef.current?.[blockId];
+  const resolved = (b?.resolved ?? {}) as Record<string, any>;
+  return Object.keys(resolved).filter((k) => !String(resolved[k]?.value ?? "").trim());
+}
+
+function nextMissingNotAsked(blockId: string | undefined): string | null {
+  const missing = missingSlotsFor(blockId);
+  for (const s of missing) {
+    if (!wasAsked(blockId, s)) return s;
+  }
+  return null;
+}
+
+ // ===== Lire ?block=... & ?slot=... =====
+useEffect(() => {
+  const wantedBlock = searchParams?.get("block") || null;
+  const wantedSlot  = searchParams?.get("slot")  || null;
+
+  if (!wantedBlock || !blocks) return;
+  if (!blocks[wantedBlock]) return;
+
+  // reset propre
+  setSelectedId(wantedBlock);
+  setMessages([]);
+  firstIAAskedRef.current = false;
+
+  // prépare la 1ère question si slot présent
+  if (wantedSlot) {
+    setFirstQuestion(`Parlons du champ « ${wantedSlot} ». Peux-tu le préciser ou le compléter ?`);
+    firstQPrimedRef.current = true;
+    firstQuestionSlotRef.current = wantedSlot;
+  } else {
+    setFirstQuestion("");
+    firstQPrimedRef.current = false;
+    firstQuestionSlotRef.current = null;
+  }
+}, [searchParams, blocks]);
+
+
 
   // ===== IA Questions naturelles =====
   const [aiQ, setAiQ] = useState<string>("");
   const [aiEnabled, setAiEnabled] = useState(true);
-  const firstIAAskedRef = useRef(false);
 
+  // ===== STT =====
+  const [livePartial, setLivePartial] = useState("");
+  const [lastFinalRaw, setLastFinalRaw] = useState("");
+  const [lastSavedText, setLastSavedText] = useState("");
+  const sttCtxRef = useRef<{ blockId?: string; question?: string } | null>(null);
+
+  // ===== Pending si bloc pas prêt =====
+  const [pendingAnswer, setPendingAnswer] = useState<PendingPayload | null>(null);
+  useEffect(() => {
+    const blkId = getActiveBlockId();
+    if (pendingAnswer && (pendingAnswer.blockId || blkId) && (pendingAnswer.question || questionRef.current)) {
+      (async () => {
+        const toSend = pendingAnswer;
+        setPendingAnswer(null);
+        await commitAnswer(toSend.text, {
+          blockId: toSend.blockId || blkId,
+          question: toSend.question || questionRef.current,
+        });
+      })();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeBlock?.id, guided, selectedId, gIndex, qIndex]);
+
+  // ===== Utils =====
+  function isDuplicateAssistant(text: string): boolean {
+    const last = messages[messages.length - 1];
+    if (!last || last.role !== "assistant") return false;
+    return last.text.trim() === text.trim();
+  }
+  function uniquifyQuestionForBlock(blockId: string, baseQ: string): string {
+    const b = blocksRef.current?.[blockId];
+    const entries = (b?.entries ?? []) as any[];
+    const same = entries.filter((e) => (e?.q ?? "") === baseQ);
+    if (same.length === 0) return baseQ;
+    return `${baseQ} (${same.length + 1})`;
+  }
+
+  // ===== Agent SDK helper (retourne say/patch/done) =====
+  function currentProfileFor(blockId: string): Record<string, string> {
+    const b = blocksRef.current?.[blockId];
+    const resolved = (b?.resolved ?? {}) as Record<string, { value?: string }>;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(resolved)) {
+      const val = String((v as any)?.value ?? "").trim();
+      if (val) out[k] = val;
+    }
+    return out;
+  }
+  async function askAgent(message: string, sessionId: string, sectionId: string) {
+  try {
+    const userHint = {
+      message,              // texte utilisateur
+      sectionId,            // bloc courant
+      sessionId,
+      depthBudget: 3        // budget d’approfondissement max (un peu plus de relance)
+    };
+
+    const res = await fetch("/api/agent/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...userHint, profile: currentProfileFor(sectionId) }),
+    });
+    const json = await res.json().catch(() => null);
+    if (res.ok && json && typeof json.say === "string") {
+      return { say: String(json.say).trim(), patch: json.patch || null, done: !!json.done };
+    }
+  } catch {}
+  return { say: "", patch: null, done: false };
+}
+
+
+  // ===== Agent heuristique legacy (conservé en fallback) =====
   async function fetchNextQuestionFor(blockId: string, lastAnswer?: string) {
     if (!aiEnabled || !blockId) return "";
     try {
-      const schema: any = (schemaJson as any)[blockId];
-      if (!schema) return "";
+      const entries = (blocksRef.current?.[blockId]?.entries ?? []).map((e: any) => ({
+        q: e?.q || "",
+        a: e?.a || "",
+      }));
       const res = await fetch("/api/llm/nextQuestion", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          blockId,
-          lastAnswer: lastAnswer || "",
-        }),
+        body: JSON.stringify({ blockId, lastAnswer: lastAnswer || "", entries }),
       });
       const json = await res.json().catch(() => ({}));
       if (res.ok && json?.ok && typeof json.question === "string") {
@@ -175,39 +400,51 @@ export default function InterviewPage() {
     }
   }
 
-  // Reset du fil quand on change de bloc actif
-  useEffect(() => {
-    firstIAAskedRef.current = false;
-    setAiQ("");
-    setMessages([]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeBlock?.id]);
+  // ===== Première question IA à l’arrivée sur un bloc =====
+useEffect(() => {
+  if (!activeBlock) return;
+  if (firstIAAskedRef.current) return;
 
-  // Première question IA à l'arrivée sur un bloc
-  useEffect(() => {
-    if (!activeBlock) return;
-    if (!aiEnabled) return;
-    if (firstIAAskedRef.current) return;
+  // 1) Si on a une firstQuestion (venant de ?slot=...), on la pose et on s'arrête.
+  if (firstQPrimedRef.current && firstQuestion.trim()) {
+    const q = firstQuestion.trim();
+    setMessages((prev) => [...prev, { role: "assistant", text: q, ts: Date.now() }]);
+    // marque le slot demandé comme posé pour éviter la redite
+    markAsked(getActiveBlockId() || activeBlock?.id, firstQuestionSlotRef.current);
+    if (ttsOn) { try { speakTTS(q, ttsVoice); } catch {} }
+    firstIAAskedRef.current = true;
+    return; // ✅ surtout ne pas appeler l'agent derrière
+  }
 
-    (async () => {
-      const blk = getActiveBlockId();
-      if (!blk) return;
-
-      const lastAnswer = (activeBlock.entries?.slice(-1)[0] as any)?.a || "";
-      const q = await fetchNextQuestionFor(blk, lastAnswer);
-      const finalQ = q || nextQuestion;
-      setAiQ(finalQ);
-
-      setMessages((prev) => [...prev, { role: "assistant", text: finalQ, ts: Date.now() }]);
-      if (ttsOn) {
-        try { await speakTTS(finalQ, ttsVoice); } catch {}
+  // 2) Sinon, on demande UNE question à l’agent
+  (async () => {
+    const blkId = activeBlock.id;
+    const { say: agentQ, done } = await askAgent("", blkId, blkId);
+    if (done) {
+      enableFreeFlow(blkId);
+      const qDone = (agentQ && /\?\s*$/.test(agentQ)) ? agentQ : await getFreeChatQuestion(blkId);
+      if (qDone) {
+        setMessages((prev) => [...prev, { role: "assistant", text: qDone, ts: Date.now() }]);
+        if (ttsOn) { try { await speakTTS(qDone, ttsVoice); } catch {} }
       }
       firstIAAskedRef.current = true;
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeBlock?.id, aiEnabled, ttsOn, ttsVoice]);
+      return;
+    }
+    const q =
+      (agentQ && agentQ.trim()) ||
+      `Sur « ${activeBlock.title ?? blkId} », qu’aimerais-tu préciser ?`;
 
-  // ===== Correction (reformulation) =====
+    setMessages((prev) => [...prev, { role: "assistant", text: q, ts: Date.now() }]);
+    if (ttsOn) { try { await speakTTS(q, ttsVoice); } catch {} }
+    firstIAAskedRef.current = true;
+  })();
+  // ❗ Dépendances FIXES : pas de variable conditionnelle qui change la taille
+}, [activeBlock?.id, ttsOn, ttsVoice]);
+
+
+
+
+  // ===== Scribe (reformulation) =====
   async function reformulate(text: string, blockId?: string) {
     const clean = text.trim();
     if (!clean) return "";
@@ -243,40 +480,6 @@ export default function InterviewPage() {
     }
   }
 
-  // ===== Transcription panneau =====
-  const [livePartial, setLivePartial] = useState("");
-  const [lastFinalRaw, setLastFinalRaw] = useState("");
-  const [lastSavedText, setLastSavedText] = useState("");
-
-  // ===== Contexte STT capturé au start =====
-  const sttCtxRef = useRef<{ blockId?: string; question?: string } | null>(null);
-
-  // ===== File d’attente si finale avant bloc prêt =====
-  const [pendingAnswer, setPendingAnswer] = useState<PendingPayload | null>(null);
-  useEffect(() => {
-    const blkId = getActiveBlockId();
-    if (pendingAnswer && (pendingAnswer.blockId || blkId) && (pendingAnswer.question || questionRef.current)) {
-      (async () => {
-        const toSend = pendingAnswer;
-        setPendingAnswer(null);
-        await commitAnswer(toSend.text, {
-          blockId: toSend.blockId || blkId,
-          question: toSend.question || questionRef.current,
-        });
-      })();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeBlock?.id, guided, selectedId, gIndex, qIndex]);
-
-  // ===== Génère étiquette Q unique si déjà utilisée =====
-  function uniquifyQuestionForBlock(blockId: string, baseQ: string): string {
-    const b = blocksRef.current?.[blockId];
-    const entries = (b?.entries ?? []) as any[];
-    const same = entries.filter((e) => (e?.q ?? "") === baseQ);
-    if (same.length === 0) return baseQ;
-    return `${baseQ} (${same.length + 1})`;
-  }
-
   // ===== Commit (save) =====
   async function commitAnswer(raw: string, ctx?: { blockId?: string; question?: string }) {
     const base = raw.trim();
@@ -294,21 +497,17 @@ export default function InterviewPage() {
     setMessages((prev) => [...prev, { role: "user", text: base, ts: Date.now() }]);
     setLastFinalRaw(base);
 
-    // Correction IA
+    // Correction IA locale
     const corrected = await reformulate(base, blkId);
     setLastSavedText(corrected);
 
     // Q stockée (unique)
     const questionToStore = uniquifyQuestionForBlock(blkId, qRaw || "Question");
 
-    // Save bloc
-    try {
-      await addTextEntry(blkId, questionToStore, corrected);
-    } catch (e) {
-      console.error("Échec addTextEntry:", e);
-    }
+    // Save bloc (ton stockage existant)
+    try { await addTextEntry(blkId, questionToStore, corrected); } catch (e) { console.error("addTextEntry:", e); }
 
-    // Avancement guidé
+    // Avancement guidé (pinned)
     if (guidedRef.current) {
       const b = blocksRef.current?.[blkId];
       const p = b?.pinnedQuestions ?? [];
@@ -330,23 +529,159 @@ export default function InterviewPage() {
       }
     }
 
-    // Question IA suivante
+    // ===== Cycle suivant =====
     try {
-      const blk = ctx?.blockId || blockIdRef.current;
-      const qIA = await fetchNextQuestionFor(blk || "", corrected);
-      const finalQ = qIA || nextQuestion;
-      setAiQ(finalQ);
-      setMessages((prev) => [...prev, { role: "assistant", text: finalQ, ts: Date.now() }]);
-      if (ttsOn) {
-        try { await speakTTS(finalQ, ttsVoice); } catch {}
+      const blkForSession = blkId; // 1 thread par bloc
+      let finalQ = "";
+
+      if (AGENT_MODE && !freeFlowBlocks[blkForSession]) {
+        const { say: agentQ, patch, done } = await askAgent(corrected, blkForSession, blkForSession);
+
+        // Applique les champs écrits par l'agent AU BON BLOC
+        if (patch && typeof setResolved === "function") {
+          const toText = (val: any): string => {
+            if (val == null) return "";
+            if (typeof val === "string") return val;
+            if (typeof val === "number" || typeof val === "boolean") return String(val);
+            if (Array.isArray(val)) return val.map(toText).join(" ");
+            if (typeof val === "object") {
+              if (typeof (val as any).value === "string") return (val as any).value;
+              if (typeof (val as any).text === "string") return (val as any).text;
+              if (typeof (val as any).label === "string") return (val as any).label;
+              try { return JSON.stringify(val); } catch { return String(val); }
+            }
+            return String(val);
+          };
+
+          const payload: Record<string, { value: string; source?: string }> = {};
+          for (const [k, v] of Object.entries(patch)) {
+            payload[k] = { value: toText(v), source: "agent_sdk" };
+          }
+          await setResolved(blkId, payload);
+
+          const pretty = Object.entries(patch).map(([k, v]) => `${k} = ${toText(v)}`).join(", ");
+          if (pretty) {
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", text: `Noté : ${pretty}.`, ts: Date.now() },
+            ]);
+          }
+        }
+        if (done) {
+          enableFreeFlow(blkForSession);
+          finalQ = (agentQ && /\?\s*$/.test(agentQ)) ? agentQ : await getFreeChatQuestion(blkForSession, corrected);
+        } else {
+          // Si l'agent ne propose pas une question claire, tente une relance contextuelle avant le fallback pinned
+          if (!agentQ || !/\?\s*$/.test(agentQ)) {
+            const probeQ = await getFreeChatQuestion(blkForSession, corrected);
+            finalQ = probeQ || nextQuestion;
+          } else {
+            finalQ = agentQ;
+          }
+        }
+      } else {
+        // Si la section est marquée "chat libre", bypass legacy et pose une relance souple
+        if (freeFlowBlocks[blkForSession]) {
+          const q = await getFreeChatQuestion(blkForSession, corrected);
+          finalQ = q || nextQuestion;
+        } else {
+          // ---- Legacy validate/commit/nextQuestion (conservé en fallback) ----
+          const validateRes = await fetch("/api/llm/validate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              blockId: blkId,
+              canonical: {},
+              locks: {},
+              lastAnswer: corrected,
+              section: blkId
+            }),
+          });
+          const validateJson = await validateRes.json().catch(() => ({}));
+
+          if (validateRes.ok && validateJson) {
+            const toUpdate = validateJson.fields_to_update || {};
+            const locksUpdate = validateJson.locks_update || {};
+            if ((Object.keys(toUpdate).length || Object.keys(locksUpdate).length)) {
+              await fetch("/api/llm/commit", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  sessionId: "local",
+                  fields_to_update: toUpdate,
+                  locks_update: locksUpdate,
+                }),
+              });
+              const pretty = Object.entries(toUpdate).map(([k, v]) => `${k} = ${String(v)}`).join(", ");
+              if (pretty) {
+                setMessages((prev) => [
+                  ...prev,
+                  { role: "assistant", text: `Merci. J’ai noté ${pretty}.`, ts: Date.now() },
+                ]);
+              }
+              if (typeof setResolved === "function") {
+                const payload: Record<string, { value: string; source?: string }> = {};
+                for (const [k, v] of Object.entries(toUpdate)) {
+                  payload[k] = { value: String(v), source: "agent_auto" };
+                }
+                await setResolved(blkId, payload);
+              }
+            }
+
+            finalQ =
+              (typeof validateJson.followup === "string" && validateJson.followup.trim())
+                ? validateJson.followup.trim()
+                : "";
+            if (!finalQ) finalQ = await fetchNextQuestionFor(blkId, corrected) || nextQuestion;
+          } else {
+            finalQ = await fetchNextQuestionFor(blkId, corrected) || nextQuestion;
+          }
+        }
       }
-    } catch {}
+
+      // priorité aux slots manquants non encore posés
+      {
+        const nm = nextMissingNotAsked(blkForSession);
+        if (nm) {
+          finalQ = `Peux-tu me renseigner « ${nm} » ?`;
+          markAsked(blkForSession, nm);
+        }
+      }
+      // priorité aux slots manquants non encore posés
+      {
+        const nm = nextMissingNotAsked(blkId);
+        if (nm) {
+          finalQ = `Peux-tu me renseigner « ${nm} » ?`;
+          markAsked(blkId, nm);
+        }
+      }
+      setAiQ(finalQ);
+      if (!isDuplicateAssistant(finalQ)) {
+        setMessages((prev) => [...prev, { role: "assistant", text: finalQ, ts: Date.now() }]);
+        if (ttsOn) { try { await speakTTS(finalQ, ttsVoice); } catch {} }
+      }
+    } catch {
+      let finalQ = await fetchNextQuestionFor(blkId, corrected);
+      if (!finalQ) finalQ = nextQuestion;
+      // priorité aux slots manquants non encore posés
+      {
+        const blkIdNext = (typeof getActiveBlockId === "function" ? getActiveBlockId() : undefined) || activeBlock?.id || selectedId || undefined;
+        const nm = nextMissingNotAsked(blkIdNext);
+        if (nm) {
+          finalQ = `Peux-tu me renseigner « ${nm} » ?`;
+          markAsked(blkIdNext, nm);
+        }
+      }
+      setAiQ(finalQ);
+      if (!isDuplicateAssistant(finalQ)) {
+        setMessages((prev) => [...prev, { role: "assistant", text: finalQ, ts: Date.now() }]);
+        if (ttsOn) { try { await speakTTS(finalQ, ttsVoice); } catch {} }
+      }
+    }
   }
 
-  // ===== Saisie clavier =====
+  // ===== Saisie / STT =====
   const [draft, setDraft] = useState("");
-
-  // ===== STT events =====
   const [status, setStatus] = useState("");
 
   function upsertDraft(text: string) {
@@ -364,6 +699,26 @@ export default function InterviewPage() {
     const key = "draft-singleton";
     setMessages((prev) => prev.filter((m) => m.key !== key));
   }
+// ===== Latence/endpointing côté client (debounce de silence) =====
+const SILENCE_DEBOUNCE_MS = 1400; // ajuste 1000–2000ms selon ton débit
+const finalizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+const queuedTextRef = useRef<string>("");
+
+function scheduleFinalize(text: string, ctx?: { blockId?: string; question?: string }) {
+  const clean = (text || "").trim();
+  if (!clean) return;
+  queuedTextRef.current = clean;
+
+  if (finalizeTimerRef.current) clearTimeout(finalizeTimerRef.current);
+  finalizeTimerRef.current = setTimeout(async () => {
+    const payload = (queuedTextRef.current || "").trim();
+    queuedTextRef.current = "";
+    finalizeTimerRef.current = null;
+
+    const effectiveCtx = ctx || sttCtxRef.current || { blockId: getActiveBlockId(), question: aiQ || questionRef.current };
+    await commitAnswer(payload, effectiveCtx);
+  }, SILENCE_DEBOUNCE_MS);
+}
 
   const handlePartial = (t: string) => {
     const clean = t.trim();
@@ -379,22 +734,20 @@ export default function InterviewPage() {
       setLivePartial("");
       return;
     }
-
     const ctx = sttCtxRef.current || undefined;
-
     if (!(ctx?.blockId || blockIdRef.current)) {
       setLastFinalRaw(clean);
       setPendingAnswer({ text: clean, blockId: ctx?.blockId, question: ctx?.question });
       setLivePartial("");
       return;
     }
-
     await commitAnswer(clean, ctx);
     setLivePartial("");
   };
 
-  // ===== Fallback injection si IA pas prête (une seule fois) =====
+  // ===== (IMPORTANT) Pas de double question automatique en mode agent =====
   useEffect(() => {
+    if (AGENT_MODE) return; // pas de deuxième question auto
     if (!blkIdReady) return;
 
     const last = messages[messages.length - 1];
@@ -404,12 +757,14 @@ export default function InterviewPage() {
 
     if (lastIsAssistant && (lastText === fallbackQ || lastText === aiQ.trim())) return;
 
-    if (!aiQ) {
-      setMessages((prev) => [...prev, { role: "assistant", text: fallbackQ, ts: Date.now() }]);
-      if (ttsOn) {
-        try { speakTTS(fallbackQ, ttsVoice); } catch {}
+    (async () => {
+      const q = aiQ || fallbackQ;
+      if (!isDuplicateAssistant(q)) {
+        setMessages((prev) => [...prev, { role: "assistant", text: q, ts: Date.now() }]);
+        if (ttsOn) { try { speakTTS(q, ttsVoice); } catch {} }
       }
-    }
+      if (!aiQ) setAiQ(q);
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [blkIdReady, activeBlock?.id, nextQuestion, ttsOn, ttsVoice]);
 
@@ -458,6 +813,7 @@ export default function InterviewPage() {
                     setScriptOrder(DEFAULT_ORDER.filter((id) => !!blocks?.[id]));
                     setGIndex(0);
                     setQIndex(0);
+                    firstIAAskedRef.current = false;
                   }
                 }}
               />
@@ -478,14 +834,10 @@ export default function InterviewPage() {
             )}
           </div>
 
-          {/* TTS + IA switches + Sélecteur de voix */}
+          {/* TTS + IA + Voix */}
           <div className="flex items-center gap-3 text-xs">
             <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={ttsOn}
-                onChange={(e) => setTtsOn(e.target.checked)}
-              />
+              <input type="checkbox" checked={ttsOn} onChange={(e) => setTtsOn(e.target.checked)} />
               Lecture vocale des questions
             </label>
 
@@ -515,20 +867,12 @@ export default function InterviewPage() {
             </div>
 
             <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={aiOptIn}
-                onChange={(e) => setAiOptIn(e.target.checked)}
-              />
+              <input type="checkbox" checked={aiOptIn} onChange={(e) => setAiOptIn(e.target.checked)} />
               Correction automatique (IA)
             </label>
 
             <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={aiEnabled}
-                onChange={(e) => setAiEnabled(e.target.checked)}
-              />
+              <input type="checkbox" checked={aiEnabled} onChange={(e) => setAiEnabled(e.target.checked)} />
               Questions naturelles (LLM)
             </label>
           </div>
@@ -544,10 +888,11 @@ export default function InterviewPage() {
                 value={selectedId}
                 onChange={(e) => {
                   setSelectedId(e.target.value);
-                  // messages reset → fait sur changement de activeBlock.id
+                  setMessages([]);
+                  firstIAAskedRef.current = false;
                 }}
               >
-                {items.map((b) => (
+                {itemsSorted.map((b) => (
                   <option key={b.id} value={b.id}>
                     {b.title} — {b.entries.length} entrées ({b.progress}%)
                   </option>
@@ -558,11 +903,7 @@ export default function InterviewPage() {
             {/* STT moteur */}
             {mode === "voice" && (
               <label className="text-xs text-gray-600 flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={usePro}
-                  onChange={(e) => setUsePro(e.target.checked)}
-                />
+                <input type="checkbox" checked={usePro} onChange={(e) => setUsePro(e.target.checked)} />
                 STT Deepgram (pro)
               </label>
             )}
@@ -574,10 +915,7 @@ export default function InterviewPage() {
       {/* Fil de chat */}
       <section className="border rounded-xl p-3 bg-white space-y-2" style={{ minHeight: 360 }}>
         {messages.map((m, i) => (
-          <div
-            key={m.key ?? i}
-            className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-          >
+          <div key={m.key ?? i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
             <div
               className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm shadow ${
                 m.role === "assistant"
@@ -600,32 +938,56 @@ export default function InterviewPage() {
           <div className="flex items-center gap-2">
             {usePro ? (
               <DeepgramSTT
-                onPartial={handlePartial}
-                onFinal={handleFinal}
-                setStatus={setStatus}
-                onStart={() => {
-                  sttCtxRef.current = {
-                    blockId: getActiveBlockId(),
-                    question: aiQ || questionRef.current,
-                  };
-                }}
-                onStop={() => {}}
-                buttonLabel="Parler (Deepgram)"
-              />
+  onPartial={(t) => {
+    const clean = t.trim();
+    setLivePartial(clean);
+    if (clean) {
+      upsertDraft(clean);
+      scheduleFinalize(clean, sttCtxRef.current || { blockId: getActiveBlockId(), question: aiQ || questionRef.current });
+    }
+  }}
+  onFinal={(t) => {
+    clearDraft();
+    const clean = t.trim();
+    if (!clean) { setLivePartial(""); return; }
+    // ❗ au lieu de commit immédiat → on passe par le debounce
+    scheduleFinalize(clean, sttCtxRef.current || { blockId: getActiveBlockId(), question: aiQ || questionRef.current });
+    setLivePartial("");
+  }}
+  setStatus={setStatus}
+  onStart={() => {
+    sttCtxRef.current = { blockId: getActiveBlockId(), question: aiQ || questionRef.current };
+  }}
+  onStop={() => {}}
+  buttonLabel="Parler (Deepgram)"
+/>
+
             ) : (
               <LiveSTT
-                onPartial={handlePartial}
-                onFinal={handleFinal}
-                setStatus={setStatus}
-                onStart={() => {
-                  sttCtxRef.current = {
-                    blockId: getActiveBlockId(),
-                    question: aiQ || questionRef.current,
-                  };
-                }}
-                onStop={() => {}}
-                buttonLabel="Parler (navigateur)"
-              />
+  onPartial={(t) => {
+    const clean = t.trim();
+    setLivePartial(clean);
+    if (clean) {
+      upsertDraft(clean);
+      scheduleFinalize(clean, sttCtxRef.current || { blockId: getActiveBlockId(), question: aiQ || questionRef.current });
+    }
+  }}
+  onFinal={(t) => {
+    clearDraft();
+    const clean = t.trim();
+    if (!clean) { setLivePartial(""); return; }
+    // ❗ pas de commit direct, on attend SILENCE_DEBOUNCE_MS
+    scheduleFinalize(clean, sttCtxRef.current || { blockId: getActiveBlockId(), question: aiQ || questionRef.current });
+    setLivePartial("");
+  }}
+  setStatus={setStatus}
+  onStart={() => {
+    sttCtxRef.current = { blockId: getActiveBlockId(), question: aiQ || questionRef.current };
+  }}
+  onStop={() => {}}
+  buttonLabel="Parler (navigateur)"
+/>
+
             )}
             <span className="text-xs text-gray-500">
               {blkIdReady
@@ -649,10 +1011,7 @@ export default function InterviewPage() {
                   if (!blkIdReady) return;
                   const text = draft.trim();
                   if (text) {
-                    commitAnswer(text, {
-                      blockId: getActiveBlockId(),
-                      question: aiQ || questionRef.current,
-                    });
+                    commitAnswer(text, { blockId: getActiveBlockId(), question: aiQ || questionRef.current });
                     setDraft("");
                   }
                 }
@@ -664,10 +1023,7 @@ export default function InterviewPage() {
               onClick={() => {
                 const text = draft.trim();
                 if (text) {
-                  commitAnswer(text, {
-                    blockId: getActiveBlockId(),
-                    question: aiQ || questionRef.current,
-                  });
+                  commitAnswer(text, { blockId: getActiveBlockId(), question: aiQ || questionRef.current });
                   setDraft("");
                 }
               }}

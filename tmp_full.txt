@@ -1,0 +1,1068 @@
+// src/app/blocks/page.tsx
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import { useBlocks } from "@/hooks/useBlocks";
+import type { Block, Entry } from "@/data/blocks";
+import LiveSTT from "@/app/interview/LiveSTT";
+import { useBetterTTS } from "@/hooks/useBetterTTS";
+
+type BlockWithOrder = Block & { order?: number };
+
+// Ordre fixe de secours (garde Identité en tête)
+const ORDER: Record<string, number> = {
+  identite: 0,
+  enfance: 10,
+  adolescence: 20,
+  debuts_adultes: 30,
+  metier: 40,
+  valeurs: 50,
+  anecdotes: 60,
+  lieux: 70,
+  theme_central: 80,
+  heritage: 90,
+};
+type BlocksMap = Record<string, Block>;
+
+type ReconcileItem = {
+  field: string;
+  old?: string | null;
+  new: string;
+  reason?: string;
+  confidence?: number;
+};
+type ReconcileState = Record<string, { loading: boolean; items: ReconcileItem[] }>;
+type CanonViewState = Record<string, boolean>; // toggle par bloc
+
+function ensureAgentSessionId(): string {
+  if (typeof window === "undefined") return "ms-server";
+  let sid = localStorage.getItem("agent_session_id");
+  if (!sid) {
+    sid = `ms-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    localStorage.setItem("agent_session_id", sid);
+  }
+  return sid;
+}
+
+function downloadJson(filename: string, data: unknown) {
+  try {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch {}
+}
+
+export default function BlocksPage() {
+  const _api = useBlocks() as any;
+
+  const loading: boolean = _api.loading;
+  const blocks: BlocksMap | null = _api.blocks ?? null;
+
+  const clearAll: () => Promise<void> = _api.clearAll;
+  const setSummary: (blockId: string, summary: string) => Promise<void> = _api.setSummary;
+  const setResolved: (
+    blockId: string,
+    patch: Record<string, { value: string; source?: string }>
+  ) => Promise<void> = _api.setResolved;
+  const cleanupConflictsFor: (blockId: string, slotId: string) => Promise<void> =
+    _api.cleanupConflictsFor;
+  const importBlocks: (raw: unknown) => Promise<void> = _api.importBlocks;
+  const addTextEntry: (blockId: string, q: string, a: string) => Promise<void> = _api.addTextEntry;
+  const unsetResolved: (blockId: string, key: string) => Promise<void> = _api.unsetResolved;
+  const replaceInEntries: (blockId: string, replacements: { find: string; replace: string }[]) => Promise<void> = _api.replaceInEntries;
+
+  const [agentNote, setAgentNote] = useState<Record<string, string>>({});
+  const [sessionId, setSessionId] = useState<string>("");
+
+  // Saisie manuelle par bloc
+  const [manualMode, setManualMode] = useState<Record<string, "text" | "voice">>({});
+  const [manualAnswer, setManualAnswer] = useState<Record<string, string>>({});
+  const [voiceDrafts, setVoiceDrafts] = useState<Record<string, string>>({});
+  const [sttStatus, setSttStatus] = useState<Record<string, string>>({});
+
+  // Chat par bloc (transient UI state)
+  type ChatMsg = { role: "user" | "assistant"; text: string; ts: number };
+  const [chat, setChat] = useState<Record<string, ChatMsg[]>>({});
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [openChat, setOpenChat] = useState<Record<string, boolean>>({});
+  const [openSummary, setOpenSummary] = useState<Record<string, boolean>>({});
+
+  // Cleaner agent state
+  type CleanIssue = {
+    type: string;
+    fields: string[];
+    description: string;
+    severity?: "low" | "medium" | "high";
+    suggestion?: { patch?: Record<string, string>; reason?: string };
+    clarify_question?: string;
+  };
+  const [cleaner, setCleaner] = useState<Record<string, { loading: boolean; issues: CleanIssue[] }>>({});
+
+  function setCleanerState(blockId: string, payload: Partial<{ loading: boolean; issues: CleanIssue[] }>) {
+    setCleaner((m) => {
+      const prev = m[blockId] ?? { loading: false, issues: [] as CleanIssue[] };
+      const next = { ...prev, ...payload };
+      return { ...m, [blockId]: next };
+    });
+  }
+
+  // TTS (global à la page)
+  const [ttsOn, setTtsOn] = useState<boolean>(true);
+  const [ttsVoice, setTtsVoice] = useState<string>(() => {
+    if (typeof window === "undefined") return "alloy";
+    return localStorage.getItem("tts_voice") || "alloy";
+  });
+  const { speak: speakTTS, stop: stopTTS, loading: ttsLoading } = useBetterTTS("alloy");
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem("tts_on");
+      if (v === "0") setTtsOn(false);
+    } catch {}
+  }, []);
+  useEffect(() => {
+    try {
+      localStorage.setItem("tts_on", ttsOn ? "1" : "0");
+      if (!ttsOn) stopTTS();
+    } catch {}
+  }, [ttsOn, stopTTS]);
+  useEffect(() => {
+    try { if (typeof window !== "undefined") localStorage.setItem("tts_voice", ttsVoice); } catch {}
+  }, [ttsVoice]);
+
+  // Résumé: autosave (debounce)
+  const saveTimers = useRef<Record<string, any>>({});
+  const [draftSummaries, setDraftSummaries] = useState<Record<string, string>>({});
+  const [saveState, setSaveState] = useState<Record<string, "idle" | "saving" | "saved">>({});
+
+  // Reconcile
+  const [reconcile, setReconcile] = useState<ReconcileState>({});
+  function setRecon(blockId: string, payload: Partial<{ loading: boolean; items: ReconcileItem[] }>) {
+    setReconcile((m) => {
+      const prev = m[blockId] ?? { loading: false, items: [] as ReconcileItem[] };
+      const next = { ...prev, ...payload };
+      return { ...m, [blockId]: next };
+    });
+  }
+
+  // Affichage du profil canonique + export
+  const [showCanon, setShowCanon] = useState<CanonViewState>({});
+  function toggleCanon(blockId: string) {
+    setShowCanon((m) => ({ ...m, [blockId]: !m[blockId] }));
+  }
+
+  // === Export/Import GLOBAL ===
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  function yyyymmddHHMM() {
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return (
+      d.getFullYear().toString() +
+      pad(d.getMonth() + 1) +
+      pad(d.getDate()) +
+      "-" +
+      pad(d.getHours()) +
+      pad(d.getMinutes())
+    );
+  }
+
+  function handleExportAll() {
+    const payload = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      sessionId,
+      blocks: blocks ?? {},
+    };
+    downloadJson(`memosphere-export-${yyyymmddHHMM()}.json`, payload);
+  }
+
+  async function handleImportAllFromFile(file: File) {
+    try {
+      const text = await file.text();
+      const json = JSON.parse(text);
+
+      // validation légère
+      const rawBlocks =
+        (json && typeof json === "object" && json.blocks && typeof json.blocks === "object"
+          ? json.blocks
+          : json) ?? {};
+
+      await importBlocks(rawBlocks);
+      alert("Import réussi. Les blocs ont été remplacés.");
+    } catch (e: any) {
+      alert(`Échec d’import: ${e?.message || "fichier invalide"}`);
+    }
+  }
+
+  function triggerImport() {
+    fileInputRef.current?.click();
+  }
+
+  useEffect(() => {
+    try {
+      const sid = ensureAgentSessionId();
+      setSessionId(sid);
+    } catch {
+      setSessionId("ms-server");
+    }
+  }, []);
+
+  const items = useMemo(
+  () => (blocks ? (Object.values(blocks) as BlockWithOrder[]) : []),
+  [blocks]
+);
+
+const sorted = useMemo(() => {
+  return items.slice().sort((a, b) => {
+    const oa = (a.order ?? ORDER[a.id] ?? 0);
+    const ob = (b.order ?? ORDER[b.id] ?? 0);
+    if (oa !== ob) return oa - ob;
+    return (a.progress ?? 0) - (b.progress ?? 0);
+  });
+}, [items]);
+
+  async function verifyWithAgent(blockId: string) {
+  try {
+    const b = blocks?.[blockId] as (BlockWithOrder & any) | undefined;
+    const lastAnswer =
+      (b?.entries?.length ? (b!.entries[b!.entries.length - 1] as any).a : "") || "";
+
+    // aplatit le profil canonique { field: {value,source} } -> { field: value }
+    const canonical = Object.fromEntries(
+      Object.entries(b?.resolved ?? {}).map(([k, v]: any) => [k, (v?.value ?? "").toString()])
+    );
+
+    const locks = (b?.locks ?? {});
+
+    const res = await fetch("/api/llm/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        blockId,
+        section: blockId,
+        canonical,
+        locks,
+        lastAnswer,
+      }),
+    });
+
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json) {
+      setAgentNote((m) => ({ ...m, [blockId]: "Agent indisponible (validate)." }));
+      return;
+    }
+
+    const follow =
+      typeof json.followup === "string" && json.followup.trim()
+        ? json.followup.trim()
+        : "(pas de follow-up proposé)";
+    const missing =
+      Array.isArray(json.missing) && json.missing.length
+        ? `Champs manquants: ${json.missing.join(", ")}`
+        : "Aucun champ manquant détecté";
+
+    setAgentNote((m) => ({
+      ...m,
+      [blockId]: `${follow}\n${missing}`,
+    }));
+  } catch (e: any) {
+    setAgentNote((m) => ({ ...m, [blockId]: `Erreur: ${e?.message || "réseau"}` }));
+  }
+}
+
+
+  async function handleResetAll() {
+    const ok = confirm(
+      "Tout réinitialiser ? Cela efface les blocs locaux ET remet à zéro la mémoire de l’agent."
+    );
+    if (!ok) return;
+
+    try {
+      await clearAll();
+      try {
+        await fetch("/api/agent/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+      } catch {}
+      const newSid = `ms-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+      localStorage.setItem("agent_session_id", newSid);
+      setSessionId(newSid);
+    } finally {
+      location.reload();
+    }
+  }
+
+  function setDraft(blockId: string, text: string) {
+    setDraftSummaries((m) => ({ ...m, [blockId]: text }));
+    setSaveState((m) => ({ ...m, [blockId]: "saving" }));
+
+    // debounce 600ms
+    if (saveTimers.current[blockId]) {
+      clearTimeout(saveTimers.current[blockId]);
+    }
+    saveTimers.current[blockId] = setTimeout(async () => {
+      try {
+        await setSummary(blockId, text.trim());
+        setSaveState((m) => ({ ...m, [blockId]: "saved" }));
+      } catch {
+        setSaveState((m) => ({ ...m, [blockId]: "idle" }));
+      }
+    }, 600);
+  }
+
+  async function generateSummary(blockId: string) {
+    const b = blocks?.[blockId];
+    const entries: { q: string; a: string }[] = (b?.entries || [])
+      .filter((e: Entry) => e.type === "texte")
+      .map((e: any) => ({ q: e?.q || "", a: e?.a || "" }));
+
+    setSaveState((m) => ({ ...m, [blockId]: "saving" }));
+    try {
+      const res = await fetch("/api/llm/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entries, lang: "fr", style: "biographique" }),
+      });
+      const json = await res.json().catch(() => ({}));
+      const text = json?.ok && typeof json.text === "string" ? json.text : "";
+      setDraftSummaries((m) => ({ ...m, [blockId]: text }));
+      await setSummary(blockId, text);
+      setSaveState((m) => ({ ...m, [blockId]: "saved" }));
+    } catch {
+      setSaveState((m) => ({ ...m, [blockId]: "idle" }));
+      alert("Échec de génération du résumé.");
+    }
+  }
+
+  async function proposeCorrections(blockId: string) {
+  const b = blocks?.[blockId];
+  if (!b) return;
+
+  const summaryText = (draftSummaries[blockId] ?? "").trim();
+  if (!summaryText) {
+    alert("Le résumé est vide.");
+    return;
+  }
+
+  // ⚠️ Aplatir le profil canonique -> { field: "value" }
+  const currentResolved = (b as any).resolved || {};
+  const currentFlat: Record<string, string> = Object.fromEntries(
+    Object.entries(currentResolved).map(([k, v]: any) => [
+      k,
+      (v && typeof v === "object" && "value" in v && v.value != null) ? String(v.value) : String(v ?? ""),
+    ])
+  );
+
+  setRecon(blockId, { loading: true });
+  try {
+    const res = await fetch("/api/llm/reconcile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        blockId,
+        summaryText,
+        current: currentFlat, // 🔧 envoyer la version plate
+        // lang: "fr", // <-- si ton endpoint est sensible à la langue, décommente
+      }),
+    });
+
+    const json = await res.json().catch(() => ({}));
+    const items = Array.isArray(json?.proposals) ? (json.proposals as ReconcileItem[]) : [];
+
+    setRecon(blockId, { loading: false, items });
+    if (!items.length) {
+      // Petit feedback utile pour debug côté serveur
+      const reason = typeof json?.reason === "string" && json.reason
+        ? `\nRaison: ${json.reason}`
+        : "";
+      alert("Aucune correction détectée." + reason);
+    }
+  } catch (e) {
+    setRecon(blockId, { loading: false, items: [] });
+    alert("Échec des propositions de correction.");
+  }
+}
+
+  async function handleAddManual(blockId: string) {
+    const b = blocks?.[blockId];
+    if (!b) return;
+    const mode = manualMode[blockId] || "text";
+    const q = ""; // champ libre: pas de question associée
+    const text = (mode === "text" ? manualAnswer[blockId] : voiceDrafts[blockId] || "").trim();
+    if (!text) return;
+    // 1) Affiche le message utilisateur dans le chat
+    setChat((m) => ({
+      ...m,
+      [blockId]: [...(m[blockId] || []), { role: "user", text, ts: Date.now() }],
+    }));
+    // 2) Enregistre l'entrée libre dans le bloc
+    try { await addTextEntry(blockId, q, text); } catch {}
+    if (mode === "text") setManualAnswer((m) => ({ ...m, [blockId]: "" }));
+    else setVoiceDrafts((m) => ({ ...m, [blockId]: "" }));
+    // 3) Interroge l'agent pour une relance + patch éventuel
+    try {
+      const profile: Record<string, string> = Object.fromEntries(
+        Object.entries((b.resolved || {}) as any).map(([k, v]: any) => [k, String(v?.value ?? "").trim()]).filter(([,v]) => v)
+      );
+      const res = await fetch("/api/agent/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, sessionId, sectionId: blockId, depthBudget: 2, profile }),
+      });
+      const json = await res.json().catch(() => null);
+      const say = (res.ok && json && typeof json.say === "string") ? String(json.say).trim() : "";
+      if (say) {
+        setChat((m) => ({
+          ...m,
+          [blockId]: [...(m[blockId] || []), { role: "assistant", text: say, ts: Date.now() }],
+        }));
+        if (ttsOn) { try { await speakTTS(say, ttsVoice); } catch {} }
+      }
+      const patch = (json && json.patch && typeof json.patch === "object") ? json.patch as Record<string, unknown> : null;
+      let applied = false;
+      if (patch && Object.keys(patch).length) {
+        const toText = (val: any): string => {
+          if (val == null) return "";
+          if (typeof val === "string") return val;
+          if (typeof val === "number" || typeof val === "boolean") return String(val);
+          if (Array.isArray(val)) return val.map(toText).join(" ");
+          if (typeof val === "object") {
+            if (typeof (val as any).value === "string") return (val as any).value;
+            if (typeof (val as any).text === "string") return (val as any).text;
+            if (typeof (val as any).label === "string") return (val as any).label;
+            try { return JSON.stringify(val); } catch { return String(val); }
+          }
+          return String(val);
+        };
+        const payload: Record<string, { value: string; source?: string }> = {};
+        for (const [k, v] of Object.entries(patch)) payload[k] = { value: toText(v), source: "agent_sdk" };
+        try { await setResolved(blockId, payload); } catch {}
+        const pretty = Object.entries(patch).map(([k, v]) => `${k} = ${toText(v)}`).join(", ");
+        if (pretty) {
+          setChat((m) => ({
+            ...m,
+            [blockId]: [...(m[blockId] || []), { role: "assistant", text: `Noté: ${pretty}.`, ts: Date.now() }],
+          }));
+        }
+        applied = true;
+      }
+      // Fallback: si pas de patch direct, essaie d'extraire via agent/resolve
+      if (!applied) {
+        try {
+          const synthEntries = [
+            ...(b.entries || []).map((e: any) => ({ type: "texte", q: e?.q || "", a: e?.a || "", ts: e?.ts || 0 })),
+            { type: "texte", q, a: text, ts: Date.now() },
+          ];
+          const res2 = await fetch("/api/agent/resolve", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ entries: synthEntries }),
+          });
+          if (res2.ok) {
+            const autoResolved = await res2.json();
+            const keys = Object.keys(autoResolved || {});
+            if (keys.length) {
+              try { await setResolved(blockId, Object.fromEntries(keys.map(k => [k, { value: String(autoResolved[k] ?? ""), source: "agent_resolve" }])) as any); } catch {}
+              const pretty2 = keys.map(k => `${k} = ${String((autoResolved as any)[k])}`).join(", ");
+              setChat((m) => ({
+                ...m,
+                [blockId]: [...(m[blockId] || []), { role: "assistant", text: `Noté: ${pretty2}.`, ts: Date.now() }],
+              }));
+            }
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+
+  async function applyCorrections(blockId: string) {
+    const data = reconcile[blockId];
+    if (!data || !data.items?.length) return;
+
+    const patch: Record<string, { value: string; source?: string }> = {};
+    for (const it of data.items) {
+      if (!it?.field || typeof it.new !== "string") continue;
+      patch[it.field] = { value: it.new, source: "summary_reconcile" };
+    }
+
+    try {
+      await setResolved(blockId, patch);
+      for (const key of Object.keys(patch)) {
+        await cleanupConflictsFor(blockId, key);
+      }
+      setRecon(blockId, { items: [] });
+      alert("Corrections appliquées au profil.");
+    } catch (e) {
+      console.warn("applyCorrections:", e);
+      alert("Échec lors de l’application des corrections.");
+    }
+  }
+
+  async function runCleaner(blockId: string) {
+    const b = blocks?.[blockId];
+    if (!b) return;
+    setCleanerState(blockId, { loading: true });
+    try {
+      const entries = (b.entries || []).map((e: any) => ({ q: e?.q || "", a: e?.a || "", ts: e?.ts || 0 }));
+      const profile = Object.fromEntries(Object.entries((b as any).resolved || {}).map(([k, v]: any) => [k, String(v?.value ?? "")]));
+      const res = await fetch("/api/llm/clean", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ blockId, entries, profile }),
+      });
+      const json = await res.json().catch(() => ({}));
+      const issues: any[] = Array.isArray(json?.issues) ? json.issues : [];
+      setCleanerState(blockId, { loading: false, issues });
+      if (!issues.length) alert("Aucune anomalie nette détectée.");
+    } catch (e) {
+      setCleanerState(blockId, { loading: false, issues: [] });
+      alert("Echec de l'analyse nettoyeur.");
+    }
+  }
+
+  async function applyCleanerPatch(blockId: string, patch?: Record<string, string>, replace?: { find: string; replace: string }[]) {
+    if (!patch || !Object.keys(patch).length) {
+      if (replace?.length) {
+        try { await replaceInEntries(blockId, replace); } catch {}
+      }
+      return;
+    }
+    const payload: Record<string, { value: string; source?: string }> = {};
+    for (const [k, v] of Object.entries(patch)) payload[k] = { value: String(v), source: "cleaner" };
+    try {
+      await setResolved(blockId, payload);
+      for (const key of Object.keys(payload)) {
+        try { await cleanupConflictsFor(blockId, key); } catch {}
+      }
+      if (replace?.length) {
+        try { await replaceInEntries(blockId, replace); } catch {}
+        // Harmonise aussi les valeurs canoniques qui contiennent encore l'ancienne mention
+        try {
+          const b = blocks?.[blockId] as any;
+          const current = (b?.resolved || {}) as Record<string, { value?: string }>;
+          const harmonise: Record<string, { value: string; source?: string }> = {};
+          for (const r of replace) {
+            const re = new RegExp(r.find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+            for (const [k, v] of Object.entries(current)) {
+              const vv = String(v?.value ?? "");
+              if (vv && re.test(vv)) {
+                harmonise[k] = { value: vv.replace(re, r.replace), source: "cleaner_harmonise" };
+              }
+            }
+          }
+          if (Object.keys(harmonise).length) {
+            await setResolved(blockId, harmonise);
+          }
+        } catch {}
+      }
+    } catch (e) {
+      console.error("applyCleanerPatch", e);
+    }
+  }
+
+  async function askClarify(blockId: string, question?: string) {
+    const q = (question || "").trim();
+    if (!q) return;
+    setChat((m) => ({ ...m, [blockId]: [...(m[blockId] || []), { role: "assistant", text: q, ts: Date.now() }] }));
+    if (ttsOn) { try { await speakTTS(q, ttsVoice); } catch {} }
+  }
+
+  useEffect(() => {
+    // initialise les drafts depuis l’état des blocs
+    if (!blocks) return;
+    const next: Record<string, string> = {};
+    for (const id of Object.keys(blocks)) {
+      next[id] = (blocks[id].summary || "").toString();
+    }
+    setDraftSummaries(next);
+  }, [blocks]);
+
+  if (loading) return <div className="p-6">Chargement…</div>;
+  if (!blocks) {
+    return (
+      <main className="max-w-4xl mx-auto p-6">
+        <header className="flex items-center justify-between mb-4">
+          <h1 className="text-2xl font-semibold">Blocs</h1>
+          <div className="flex items-center gap-2">
+            <Link href="/interview" className="text-sm text-blue-600 hover:underline">
+              → Ouvrir l’interview
+            </Link>
+            <button
+              className="text-sm px-3 py-1.5 border rounded hover:bg-red-50"
+              onClick={handleResetAll}
+              title="Réinitialise les blocs ET la mémoire de l’agent"
+            >
+              Réinitialiser (données + agent)
+            </button>
+          </div>
+        </header>
+        <div className="text-xs text-gray-500 mb-3">
+          Session agent : <code className="px-1 py-0.5 bg-gray-100 rounded">{sessionId || "…"}</code>
+        </div>
+        <div className="p-6 border rounded-xl bg-white">Aucun bloc.</div>
+      </main>
+    );
+  }
+
+  const sortedList = sorted;
+
+  return (
+    <main className="max-w-5xl mx-auto p-6 space-y-6">
+      <header className="flex items-center justify-between">
+        <h1 className="text-2xl font-semibold">Blocs</h1>
+        <div className="flex items-center gap-2">
+          <Link
+            href={`/interview?sessionId=${encodeURIComponent(sessionId)}`}
+            className="text-sm text-blue-600 hover:underline"
+          >
+            → Ouvrir l’interview
+          </Link>
+          <button
+            className="text-sm px-3 py-1.5 border rounded hover:bg-red-50"
+            onClick={handleResetAll}
+            title="Réinitialise les blocs ET la mémoire de l’agent"
+          >
+            Réinitialiser (données + agent)
+          </button>
+        </div>
+      </header>
+
+      {/* BARRE EXPORT / IMPORT GLOBALE */}
+      <section className="border rounded-xl bg-white p-4 flex flex-wrap items-center gap-3">
+        <div className="text-xs text-gray-500 mr-auto">
+          Session agent :{" "}
+          <code className="px-1 py-0.5 bg-gray-100 rounded">{sessionId || "…"}</code>
+        </div>
+
+        <button
+          className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+          onClick={handleExportAll}
+          title="Télécharge un JSON contenant tous les blocs"
+        >
+          Exporter tout (JSON)
+        </button>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/json,.json"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) {
+              handleImportAllFromFile(f).finally(() => {
+                if (fileInputRef.current) fileInputRef.current.value = "";
+              });
+            }
+          }}
+        />
+        <button
+          className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+          onClick={triggerImport}
+          title="Remplace les données locales par un JSON exporté"
+        >
+          Importer JSON…
+        </button>
+      </section>
+
+      <section className="border rounded-xl bg-white overflow-hidden">
+        <div className="grid grid-cols-12 gap-0 px-4 py-3 text-xs font-medium text-gray-500 bg-gray-50">
+          <div className="col-span-3">Bloc</div>
+          <div className="col-span-2">Progression</div>
+          <div className="col-span-1">Entrées</div>
+          <div className="col-span-6 text-right">Actions</div>
+        </div>
+
+        <ul className="divide-y">
+          {sortedList.map((b) => (
+            <li key={b.id} className="px-4 py-3">
+              <div className="grid grid-cols-12 items-start gap-3">
+                <div className="col-span-3">
+                  <div className="font-medium flex items-center gap-2">
+                    <span>{b.title}</span>
+                    <button
+                      className="text-xs px-2 py-0.5 border rounded hover:bg-gray-50"
+                      onClick={() => setCollapsed((m) => ({ ...m, [b.id]: !m[b.id] }))}
+                      title={(collapsed[b.id] ? "Développer" : "Réduire") + " ce bloc"}
+                    >
+                      {collapsed[b.id] ? "▸" : "▾"}
+                    </button>
+                  </div>
+                  <div className="text-xs text-gray-500">{b.id}</div>
+                </div>
+
+                <div className="col-span-2">
+                  <div className="w-full bg-gray-100 rounded h-2 overflow-hidden">
+                    <div
+                      className="bg-indigo-500 h-2"
+                      style={{ width: `${Math.max(0, Math.min(100, b.progress ?? 0))}%` }}
+                    />
+                  </div>
+                  <div className="text-xs text-gray-600 mt-1">{b.progress ?? 0}%</div>
+                </div>
+
+                <div className="col-span-1 text-sm text-gray-700 pt-1">
+                  {b.entries?.length ?? 0}
+                </div>
+
+                <div className="col-span-6 flex items-center justify-end gap-2">
+                  <Link
+                    href={`/interview?block=${encodeURIComponent(b.id)}&sessionId=${encodeURIComponent(
+                      sessionId
+                    )}`}
+                    className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                  >
+                    Ouvrir l’interview
+                  </Link>
+                  <Link
+  href={`/blocks/${encodeURIComponent(b.id)}`}
+  className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+  title="Éditer le bloc"
+>
+  Éditer
+</Link>
+
+                  <button
+                    onClick={() => verifyWithAgent(b.id)}
+                    className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                    title="Aperçu agent (follow-up + champs manquants)"
+                  >
+                    Vérifier avec l’agent
+                  </button>
+                  <button
+                    onClick={() => runCleaner(b.id)}
+                    className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                    title="Nettoyer: détecter doublons et incohérences"
+                  >
+                    Nettoyer
+                  </button>
+                </div>
+              </div>
+
+              {!collapsed[b.id] && (
+              <div className="mt-3 grid grid-cols-12 gap-3">
+                <div className="col-span-12">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="text-sm text-gray-700 font-medium flex items-center gap-2">
+                      <button
+                        className="text-xs px-2 py-0.5 border rounded hover:bg-gray-50"
+                        onClick={() => setOpenChat((m) => ({ ...m, [b.id]: !m[b.id] }))}
+                        title={(openChat[b.id] ?? true) ? "Réduire le chat" : "Développer le chat"}
+                      >
+                        {(openChat[b.id] ?? true) ? "▾" : "▸"}
+                      </button>
+                      <span>Chat libre</span>
+                    </div>
+                    <div className="flex items-center gap-2 text-sm">
+                      <label className="flex items-center gap-1 text-xs text-gray-600" title="Lire les questions par TTS">
+                        <input type="checkbox" checked={ttsOn} onChange={(e) => setTtsOn(e.target.checked)} />
+                        TTS
+                      </label>
+                      <button
+                        className={`px-2 py-1 border rounded ${(manualMode[b.id] || "text") === "text" ? "bg-gray-100" : ""}`}
+                        onClick={() => setManualMode((m) => ({ ...m, [b.id]: "text" }))}
+                      >
+                        Texte
+                      </button>
+                      <button
+                        className={`px-2 py-1 border rounded ${(manualMode[b.id] || "text") === "voice" ? "bg-gray-100" : ""}`}
+                        onClick={() => setManualMode((m) => ({ ...m, [b.id]: "voice" }))}
+                      >
+                        Voix
+                      </button>
+                    </div>
+                  </div>
+
+                  {(openChat[b.id] ?? true) && (
+                    <>
+                  {/* Fil de messages */}
+                  {(chat[b.id]?.length ? (
+                    <ul className="mb-2 space-y-1">
+                      {(chat[b.id] || []).map((m, idx) => (
+                        <li key={idx} className={`text-sm ${m.role === "assistant" ? "text-gray-800" : "text-gray-900"}`}>
+                          <span className={`px-2 py-1 rounded ${m.role === "assistant" ? "bg-indigo-50 text-indigo-800" : "bg-gray-100"}`}>
+                            {m.text}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null)}
+
+                  {(manualMode[b.id] || "text") === "text" ? (
+                    <>
+                      <textarea
+                        className="w-full border rounded p-3 text-sm"
+                        rows={3}
+                        placeholder="Réponds ici…"
+                        value={manualAnswer[b.id] ?? ""}
+                        onChange={(e) => setManualAnswer((m) => ({ ...m, [b.id]: e.target.value }))}
+                      />
+                      <div className="flex items-center gap-2 mt-2">
+                        <Link
+                          href={`/interview?block=${encodeURIComponent(b.id)}&sessionId=${encodeURIComponent(sessionId)}`}
+                          className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                          title="Relancer une interview ciblée pour ce bloc"
+                        >
+                          Interviewer ce bloc
+                        </Link>
+                        <button
+                          className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                          onClick={() => handleAddManual(b.id)}
+                          disabled={!manualAnswer[b.id]?.trim()}
+                        >
+                          Ajouter
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-2 mb-2">
+                        <LiveSTT
+                          onPartial={(t) => setVoiceDrafts((m) => ({ ...m, [b.id]: t }))}
+                          onFinal={(t) => setVoiceDrafts((m) => ({ ...m, [b.id]: (m[b.id] || "") + t }))}
+                          setStatus={(s) => setSttStatus((m) => ({ ...m, [b.id]: s }))}
+                          buttonLabel="Parler (navigateur)"
+                        />
+                        <span className="text-xs text-gray-600">{sttStatus[b.id] ?? "Prêt."}</span>
+                        <button
+                          className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                          onClick={() => setVoiceDrafts((m) => ({ ...m, [b.id]: "" }))}
+                        >
+                          Effacer brouillon
+                        </button>
+                        <button
+                          className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                          onClick={() => handleAddManual(b.id)}
+                          disabled={!voiceDrafts[b.id]?.trim()}
+                        >
+                          Ajouter
+                        </button>
+                      <textarea
+                        className="w-full border rounded p-3 text-sm bg-gray-50"
+                        rows={3}
+                        placeholder="Transcription (brouillon)…"
+                        value={voiceDrafts[b.id] ?? ""}
+                        onChange={(e) => setVoiceDrafts((m) => ({ ...m, [b.id]: e.target.value }))}
+                      />
+                    </>
+                  )}
+                  {agentNote[b.id] && (
+                    <div className="mt-2 text-xs text-indigo-700 bg-indigo-50 px-2 py-1 rounded">
+                      {agentNote[b.id]}
+                    </div>
+                  )}
+                </div>
+              </div>
+              )}
+
+              {/* Résumé éditable + générer + reconcile + profil + export */}
+              <div className="mt-3 grid grid-cols-12 gap-3">
+                <div className="col-span-12">
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="text-sm font-medium">Résumé</div>
+                    <div className="text-xs text-gray-500">
+                      {saveState[b.id] === "saving"
+                        ? "Enregistrement…"
+                        : saveState[b.id] === "saved"
+                        ? "Enregistré"
+                        : "—"}
+                    </div>
+                  </div>
+
+                  <textarea
+                    className="w-full border rounded p-3 text-sm bg-white"
+                    rows={4}
+                    placeholder="Résumé éditable du bloc…"
+                    value={draftSummaries[b.id] ?? ""}
+                    onChange={(e) => setDraft(b.id, e.target.value)}
+                  />
+
+                  <div className="flex items-center flex-wrap gap-2 mt-2">
+                    <button
+                      className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                      onClick={() => generateSummary(b.id)}
+                      title="Génère (ou régénère) le résumé à partir des entrées du bloc"
+                    >
+                      Générer
+                    </button>
+
+                    <button
+                      className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                      onClick={() => proposeCorrections(b.id)}
+                      disabled={!draftSummaries[b.id]?.trim()}
+                      title="Analyse le résumé pour repérer des corrections crédibles"
+                    >
+                      Proposer corrections
+                    </button>
+
+                    <button
+                      className="px-3 py-1.5 border rounded text-sm hover:bg-green-50"
+                      onClick={() => applyCorrections(b.id)}
+                      disabled={!(reconcile[b.id]?.items?.length)}
+                      title="Applique les corrections au profil canonique"
+                    >
+                      Appliquer au profil
+                    </button>
+
+                    <button
+                      className="px-2 py-1.5 border rounded text-xs hover:bg-gray-50"
+                      onClick={() => toggleCanon(b.id)}
+                      title="Afficher/Masquer le profil canonique du bloc"
+                    >
+                      {showCanon[b.id] ? "Masquer profil" : "Voir profil"}
+                    </button>
+
+                    <button
+                      className="px-2 py-1.5 border rounded text-xs hover:bg-gray-50"
+                      onClick={() => downloadJson(`${b.id}.json`, b)}
+                      title="Exporter le bloc en JSON"
+                    >
+                      Exporter JSON
+                    </button>
+
+                    {reconcile[b.id]?.loading && (
+                      <span className="text-xs text-gray-500">Analyse en cours…</span>
+                    )}
+
+                    {agentNote[b.id] && (
+                      <span className="text-xs text-indigo-700 bg-indigo-50 px-2 py-1 rounded">
+                        {agentNote[b.id]}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Liste des propositions */}
+                  {reconcile[b.id]?.items?.length > 0 && (
+                    <div className="mt-2 text-sm border rounded p-2 bg-indigo-50 text-indigo-900">
+                      <div className="font-medium mb-1">Propositions détectées :</div>
+                      <ul className="list-disc pl-5 space-y-1">
+                        {reconcile[b.id].items.map((it, idx) => (
+                          <li key={idx}>
+                            <code>{it.field}</code>: <s>{it.old ?? "—"}</s> → <b>{it.new}</b>
+                            {typeof it.confidence === "number" && (
+                              <span className="ml-2 text-xs opacity-80">
+                                ({Math.round(it.confidence * 100)}%)
+                              </span>
+                            )}
+                            {it.reason && (
+                              <span className="ml-2 text-xs opacity-80">— {it.reason}</span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  
+                  {/* Profil canonique du bloc */}
+                  {!collapsed[b.id] && showCanon[b.id] && (
+                    <div className="mt-3 text-sm border rounded p-3 bg-gray-50">
+                      <div className="font-medium mb-2">
+                        Profil canonique (valeurs consolidées)
+                      </div>
+                      {cleaner[b.id]?.loading && (
+                        <div className="text-xs text-gray-500 mb-2">Analyse nettoyeur…</div>
+                      )}
+                      {cleaner[b.id]?.issues?.length > 0 && (
+                        <div className="mb-3">
+                          <div className="text-xs font-medium text-gray-700 mb-1">Anomalies détectées</div>
+                          <ul className="space-y-1">
+                            {cleaner[b.id].issues.map((it, idx) => (
+                              <li key={idx} className="flex items-start gap-2">
+                                <span className={`px-1.5 py-0.5 rounded text-[10px] mt-0.5 ${
+                                  it.severity === 'high' ? 'bg-red-100 text-red-700' : it.severity === 'medium' ? 'bg-amber-100 text-amber-700' : 'bg-gray-200 text-gray-700'
+                                }`}>{it.type}</span>
+                                <div className="flex-1">
+                                  <div className="text-xs text-gray-800">{it.description}</div>
+                                  {it.fields?.length ? (
+                                    <div className="text-[10px] text-gray-500">{it.fields.join(', ')}</div>
+                                  ) : null}
+                                  <div className="flex items-center gap-2 mt-1">
+                                    {it.suggestion?.patch && (
+                                      <button
+                                        className="px-2 py-1 border rounded text-xs hover:bg-green-50"
+                                        onClick={() => applyCleanerPatch(b.id, it.suggestion?.patch, it.suggestion?.replace_in_entries)}
+                                        title={it.suggestion?.reason || 'Appliquer la correction'}
+                                      >
+                                        Appliquer suggestion
+                                      </button>
+                                    )}
+                                    {it.clarify_question && (
+                                      <button
+                                        className="px-2 py-1 border rounded text-xs hover:bg-gray-50"
+                                        onClick={() => askClarify(b.id, it.clarify_question)}
+                                        title="Poser la question au chat"
+                                      >
+                                        Poser la question
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {Object.keys((b as any).resolved || {}).length === 0 ? (
+                        <div className="text-xs text-gray-500">
+                          Aucune valeur canonique enregistrée pour ce bloc.
+                        </div>
+                      ) : (
+                        <ul className="space-y-2">
+  {Object.entries(b.resolved || {}).map(([k, v]) => (
+    <li key={k} className="flex flex-col sm:flex-row sm:items-center gap-2 text-sm">
+      <label className="text-xs w-48 font-medium text-gray-600">{k}</label>
+      <input
+        defaultValue={v?.value ?? ""}
+        className="flex-1 border rounded p-2 text-sm"
+        onBlur={async (e) => {
+          const newVal = e.target.value.trim();
+          if (newVal && newVal !== v?.value) {
+            try {
+              await setResolved(b.id, { [k]: { value: newVal, source: "user_edit" } });
+            } catch (err) {
+              console.error("Erreur update resolved:", err);
+            }
+          }
+        }}
+      />
+      <div className="text-xs text-gray-400">
+        {v?.source ?? "—"} {v?.at ? `— ${new Date(v.at).toLocaleString()}` : ""}
+      </div>
+      <button
+        className="ml-auto sm:ml-0 px-2 py-1 rounded text-xs border hover:bg-red-50"
+        title="Supprimer cette entrée du profil"
+        onClick={async () => {
+          const ok = confirm(`Supprimer « ${k} » du profil ?`);
+          if (!ok) return;
+          try { await unsetResolved(b.id, k); } catch (e) { console.error("unsetResolved", e); }
+        }}
+      >
+        🗑️
+      </button>
+    </li>
+  ))}
+</ul>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </section>
+    </main>
+  );
+}
+

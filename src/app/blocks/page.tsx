@@ -2,891 +2,884 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { useBlocks } from "@/hooks/useBlocks";
 import type { Block, Entry } from "@/data/blocks";
-import { summarizeBlockLLM } from "@/lib/summarize";
-import schemaJson from "@/data/interviewSchema.json";
+import { clearDraftStorage } from "@/lib/draftStorage";
+import LiveSTT from "@/app/interview/LiveSTT";
+import VoiceChatControls from "@/components/VoiceChatControls";
 
-/** Petit gestionnaire d'historique local (undo/redo + coalescing) */
-function useUndoManager(initial = "", coalesceMs = 400) {
-  const [value, setValue] = useState(initial);
-  const undoStack = useRef<string[]>([]);
-  const redoStack = useRef<string[]>([]);
-  const lastPushTs = useRef<number>(0);
+// Chat libre par bloc: UI locale (pas de STT ici)
 
-  // snapshot courant “version enregistrée” (externe)
-  const savedSnapshotRef = useRef<string>(initial);
+type BlockWithOrder = Block & { order?: number };
 
-  // reset complet (ex: changement de bloc)
-  const reset = (next: string) => {
-    undoStack.current = [];
-    redoStack.current = [];
-    lastPushTs.current = 0;
-    savedSnapshotRef.current = next;
-    setValue(next);
-  };
-
-  // quand l’extérieur enregistre réellement (persistance OK)
-  const markSaved = (currentPersisted: string) => {
-    savedSnapshotRef.current = currentPersisted;
-  };
-
-  const canUndo = () => undoStack.current.length > 0;
-  const canRedo = () => redoStack.current.length > 0;
-
-  const push = (next: string) => {
-    const now = Date.now();
-    const since = now - lastPushTs.current;
-    // coalesce: si modifs très rapprochées, on écrase le sommet
-    if (since > coalesceMs || undoStack.current.length === 0) {
-      undoStack.current.push(value);
-    } else {
-      undoStack.current[undoStack.current.length - 1] = value;
-    }
-    lastPushTs.current = now;
-    // tape une nouvelle valeur → vide redo
-    redoStack.current = [];
-    setValue(next);
-  };
-
-  const onChange = (next: string) => {
-    push(next);
-  };
-
-  const undo = () => {
-    if (!canUndo()) return;
-    const prev = undoStack.current.pop()!;
-    redoStack.current.push(value);
-    setValue(prev);
-  };
-
-  const redo = () => {
-    if (!canRedo()) return;
-    const next = redoStack.current.pop()!;
-    undoStack.current.push(value);
-    setValue(next);
-  };
-
-  const revertToSaved = () => {
-    const saved = savedSnapshotRef.current ?? "";
-    if (saved === value) return;
-    // on empile la valeur actuelle dans undo, comme une “étape”
-    undoStack.current.push(value);
-    redoStack.current = [];
-    setValue(saved);
-  };
-
-  return {
-    value, setValue, onChange,
-    reset, markSaved,
-    undo, redo, revertToSaved,
-    canUndo, canRedo,
-    getSaved: () => savedSnapshotRef.current,
-  };
-}
-
-/** util — mini slugify stable pour id de slot */
-function slotIdFromLabel(label: string) {
-  return String(label || "")
-    .toLowerCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // accents
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 64);
-}
-
-/** Pastilles d'objectifs locales (dérive slots depuis must_have si besoin) */
-function ChecklistChipsLocal({
-  blockId,
-  checklist,
-}: {
-  blockId: string;
-  checklist: Record<string, any> | undefined;
-}) {
-  const raw = (schemaJson as any)?.[blockId];
-  if (!raw) {
-    return (
-      <div className="text-xs text-gray-500 mt-2">
-        Aucun schéma d’objectifs pour ce bloc.
-      </div>
-    );
-  }
-
-  // 1) si le schéma a déjà des slots, on les utilise
-  let slots: Array<{ id: string; label: string }> = Array.isArray(raw.slots)
-    ? raw.slots
-    : [];
-
-  // 2) sinon on dérive des "must_have"
-  if (!slots.length && Array.isArray(raw.must_have)) {
-    slots = raw.must_have.map((label: string) => ({
-      id: slotIdFromLabel(label),
-      label,
-    }));
-  }
-
-  if (!slots.length) {
-    return (
-      <div className="text-xs text-gray-500 mt-2">
-        Aucun objectif exploitable dans ce schéma.
-      </div>
-    );
-  }
-
-  const cl = checklist || {};
-  return (
-    <div className="mt-2 flex flex-wrap gap-2">
-      {slots.map((slot) => {
-        const st = cl[slot.id]?.status || "missing";
-        const cls =
-          st === "present"
-            ? "bg-green-100 text-green-800 border-green-200"
-            : st === "partial"
-            ? "bg-amber-100 text-amber-800 border-amber-200"
-            : st === "conflict"
-            ? "bg-rose-100 text-rose-800 border-rose-200"
-            : "bg-gray-100 text-gray-700 border-gray-200";
-
-        return (
-          <span
-            key={slot.id}
-            className={`text-xs px-2 py-1 rounded border ${cls}`}
-            title={slot.id}
-          >
-            {slot.label}
-            {st === "present"
-              ? " ✓"
-              : st === "partial"
-              ? " ~"
-              : st === "conflict"
-              ? " !"
-              : " ✗"}
-          </span>
-        );
-      })}
-    </div>
-  );
-}
-
-// --- Helpers jauge (ne remplace rien) ---
-function deriveSlotsForBlock(blockId: string) {
-  const raw: any = (schemaJson as any)?.[blockId];
-  if (!raw) return [];
-  if (Array.isArray(raw.slots) && raw.slots.length) return raw.slots;
-  if (Array.isArray(raw.must_have)) {
-    const slug = (s: string) =>
-      String(s || "")
-        .toLowerCase()
-        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-        .replace(/[^a-z0-9]+/g, "_")
-        .replace(/^_+|_+$/g, "")
-        .slice(0, 64);
-    return raw.must_have.map((label: string) => ({ id: slug(label), label }));
-  }
-  return [];
-}
-
-function computeProgressLocal(blockId: string, checklist?: Record<string, any>) {
-  const slots = deriveSlotsForBlock(blockId);
-  if (!slots.length || !checklist) return { pct: 0, present: 0, total: slots.length };
-  let score = 0; // present=1, partial=0.5
-  for (const s of slots) {
-    const st = checklist[s.id]?.status;
-    if (st === "present") score += 1;
-    else if (st === "partial") score += 0.5;
-  }
-  const pct = slots.length ? Math.round((score / slots.length) * 100) : 0;
-  return { pct, present: Math.round(score), total: slots.length };
-}
-
-/* ============================================================
-   Cache locale d'analyse (stale-while-revalidate)
-   ============================================================ */
-type CachedAnalysis = {
-  checklist: Record<string, any>;
-  progress: number;
-  relances: any[];
-  hash: string;           // empreinte des données
-  updatedAt: number;      // ts ms
+// Ordre fixe de secours (garde Identité en tête)
+const ORDER: Record<string, number> = {
+  identite: 0,
+  enfance: 10,
+  adolescence: 20,
+  debuts_adultes: 30,
+  metier: 40,
+  valeurs: 50,
+  anecdotes: 60,
+  lieux: 70,
+  theme_central: 80,
+  heritage: 90,
 };
+type BlocksMap = Record<string, Block>;
 
-function hash32(s: string) {
-  let h = 2166136261 >>> 0; // FNV-1a-ish simple
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
+type ReconcileItem = {
+  field: string;
+  old?: string | null;
+  new: string;
+  reason?: string;
+  confidence?: number;
+};
+type ReconcileState = Record<string, { loading: boolean; items: ReconcileItem[] }>;
+type CanonViewState = Record<string, boolean>; // toggle par bloc
+
+function ensureAgentSessionId(): string {
+  if (typeof window === "undefined") return "ms-server";
+  let sid = localStorage.getItem("agent_session_id");
+  if (!sid) {
+    sid = `ms-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    localStorage.setItem("agent_session_id", sid);
   }
-  return (h >>> 0).toString(16);
+  return sid;
 }
 
-function makeBlockHash(b: any) {
-  // Empreinte légère des données qui importent pour l’analyse
-  const entriesLite = Array.isArray(b?.entries)
-    ? b.entries.map((e: any) => ({ q: e?.q || "", a: e?.a || "" }))
-    : [];
-  const content = b?.content || "";
-  return hash32(JSON.stringify({ entriesLite, content }));
-}
-
-function loadCachedAnalysis(blockId: string): CachedAnalysis | null {
+function downloadJson(filename: string, data: unknown) {
   try {
-    const raw = localStorage.getItem(`gaps_cache_${blockId}`);
-    if (!raw) return null;
-    const obj = JSON.parse(raw);
-    if (!obj || typeof obj !== "object") return null;
-    return obj as CachedAnalysis;
-  } catch {
-    return null;
-  }
-}
-
-function saveCachedAnalysis(blockId: string, data: CachedAnalysis) {
-  try {
-    localStorage.setItem(`gaps_cache_${blockId}`, JSON.stringify(data));
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   } catch {}
 }
 
-/* ============================================================
-   IMPORT / EXPORT JSON
-   ============================================================ */
-function downloadText(filename: string, text: string) {
-  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-function yyyymmdd_hhmm(d = new Date()) {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
-}
-
 export default function BlocksPage() {
-  const router = useRouter();
-  const {
-    loading,
-    blocks,
-    setSummary,
-    setContent,
-    renameBlock,
-    clearAll,
-    importBlocks,              // ⟵ on l’expose ici
-  } = useBlocks();
-  const list = useMemo(() => (blocks ? Object.values(blocks) : []), [blocks]);
+  const _api = useBlocks() as any;
 
-  const [activeId, setActiveId] = useState<string>("");
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [busyReset, setBusyReset] = useState(false);
+  const loading: boolean = _api.loading;
+  const blocks: BlocksMap | null = _api.blocks ?? null;
 
-  const active = useMemo<Block | null>(
-    () => (activeId && blocks ? (blocks as any)[activeId] ?? null : list[0] ?? null),
-    [activeId, blocks, list]
-  );
+  const clearAll: () => Promise<void> = _api.clearAll;
+  const setSummary: (blockId: string, summary: string) => Promise<void> = _api.setSummary;
+  const setResolved: (
+    blockId: string,
+    patch: Record<string, { value: string; source?: string }>
+  ) => Promise<void> = _api.setResolved;
+  
+  const unsetResolved: (blockId: string, key: string) => Promise<void> = _api.unsetResolved;
+const cleanupConflictsFor: (blockId: string, slotId: string) => Promise<void> =
+    _api.cleanupConflictsFor;
+  const importBlocks: (raw: unknown) => Promise<void> = _api.importBlocks;
+  const addTextEntry: (blockId: string, q: string, a: string) => Promise<void> = _api.addTextEntry;
 
-  // -----------------------------------------
-  // Sélecteur de bloc (simple)
-  // -----------------------------------------
-  const [titleDraft, setTitleDraft] = useState("");
+  const [agentNote, setAgentNote] = useState<Record<string, string>>({});
+  const [sessionId, setSessionId] = useState<string>("");
 
-  useEffect(() => {
-    setTitleDraft(active?.title ?? "");
-  }, [active?.id]); // on reset le draft quand on change de bloc
+  // Résumé: autosave (debounce)
+  const saveTimers = useRef<Record<string, any>>({});
+  const [draftSummaries, setDraftSummaries] = useState<Record<string, string>>({});
+  const [saveState, setSaveState] = useState<Record<string, "idle" | "saving" | "saved">>({});
 
-  // -----------------------------------------
-  // Éditeur principal “Mémoire (brut)” — avec historique + autosave
-  // -----------------------------------------
-  const contentMgr = useUndoManager("", 400);
-  const [contentSaveState, setContentSaveState] = useState<"idle" | "saving" | "saved">("idle");
-  const contentTimerRef = useRef<number | null>(null);
+  // Reconcile
+  const [reconcile, setReconcile] = useState<ReconcileState>({});
+  function setRecon(blockId: string, payload: Partial<{ loading: boolean; items: ReconcileItem[] }>) {
+    setReconcile((m) => {
+      const prev = m[blockId] ?? { loading: false, items: [] as ReconcileItem[] };
+      const next = { ...prev, ...payload };
+      return { ...m, [blockId]: next };
+    });
+  }
 
-  // hydrate contenu quand on change de bloc
-  useEffect(() => {
-    const initial = (active as any)?.content ?? "";
-    contentMgr.reset(initial);
-    setContentSaveState("idle");
-    if (contentTimerRef.current) {
-      window.clearTimeout(contentTimerRef.current);
-      contentTimerRef.current = null;
-    }
-  }, [active?.id]);
+  // Affichage du profil canonique + export
+  const [showCanon, setShowCanon] = useState<CanonViewState>({});
+  function toggleCanon(blockId: string) {
+    setShowCanon((m) => ({ ...m, [blockId]: !m[blockId] }));
+  }
 
-  // autosave contenu (debounce)
-  useEffect(() => {
-    if (!active) return;
-    const current = contentMgr.value;
-    if (current === ((active as any).content ?? "")) return;
-    setContentSaveState("saving");
-    if (contentTimerRef.current) window.clearTimeout(contentTimerRef.current);
-    contentTimerRef.current = window.setTimeout(async () => {
-      try {
-        await setContent((active as any).id, current);
-        setContentSaveState("saved");
-        contentMgr.markSaved(current); // aligne le snapshot “enregistré”
-        window.setTimeout(() => setContentSaveState("idle"), 800);
-      } catch {
-        setContentSaveState("idle");
-      }
-    }, 600) as unknown as number;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contentMgr.value, active?.id]);
+  // === Export/Import GLOBAL ===
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // ----- Résumé IA — avec historique -----
-  const summaryMgr = useUndoManager("", 400);
-  const [summarySaveState, setSummarySaveState] = useState<"idle" | "saving" | "saved">("idle");
-  const summaryTimerRef = useRef<number | null>(null);
+  // Chat par bloc (transient UI state)
+  type ChatMsg = { role: "user" | "assistant"; text: string; ts: number };
+  const [chat, setChat] = useState<Record<string, ChatMsg[]>>({});
+  const [openChat, setOpenChat] = useState<Record<string, boolean>>({});
+  const [chatDrafts, setChatDrafts] = useState<Record<string, string>>({});
+  const [chatSending, setChatSending] = useState<Record<string, boolean>>({});
+  const [sttStatus, setSttStatus] = useState<Record<string, string>>({});
+  const [chatMode, setChatMode] = useState<Record<string, "text" | "voice">>({});
 
-  // hydrate résumé quand on change de bloc
-  useEffect(() => {
-    const initial = active?.summary ?? "";
-    summaryMgr.reset(initial);
-    setSummarySaveState("idle");
-    if (summaryTimerRef.current) {
-      window.clearTimeout(summaryTimerRef.current);
-      summaryTimerRef.current = null;
-    }
-  }, [active?.id]);
 
-  // autosave résumé (debounce)
-  useEffect(() => {
-    if (!active) return;
-    const current = summaryMgr.value;
-    if (current === (active.summary ?? "")) return;
-    setSummarySaveState("saving");
-    if (summaryTimerRef.current) window.clearTimeout(summaryTimerRef.current);
-    summaryTimerRef.current = window.setTimeout(async () => {
-      try {
-        await setSummary(active.id, current);
-        setSummarySaveState("saved");
-        summaryMgr.markSaved(current);
-        window.setTimeout(() => setSummarySaveState("idle"), 800);
-      } catch {
-        setSummarySaveState("idle");
-      }
-    }, 600) as unknown as number;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [summaryMgr.value, active?.id]);
+  function yyyymmddHHMM() {
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return (
+      d.getFullYear().toString() +
+      pad(d.getMonth() + 1) +
+      pad(d.getDate()) +
+      "-" +
+      pad(d.getHours()) +
+      pad(d.getMinutes())
+    );
+  }
 
-  // -----------------------------------------
-  // Agent de complétude — local à la page
-  // -----------------------------------------
-  // on garde une table des checklists par bloc, pour ne pas dépendre du hook
-  const [checklists, setChecklists] = useState<Record<string, any>>({});
-  const [analyzing, setAnalyzing] = useState(false);
-  const [relances, setRelances] = useState<Record<string, any[]>>({}); // relances par bloc (optionnel)
-  const [lastAnalysisAt, setLastAnalysisAt] = useState<number | null>(null);
+  function handleExportAll() {
+    const payload = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      sessionId,
+      blocks: blocks ?? {},
+    };
+    downloadJson(`memosphere-export-${yyyymmddHHMM()}.json`, payload);
+  }
 
-  // Hydrate affichage depuis cache quand on change de bloc
-  useEffect(() => {
-    const b = active as any;
-    if (!b?.id) return;
-
-    const cached = loadCachedAnalysis(b.id);
-    if (!cached) {
-      setChecklists((prev) => ({ ...prev, [b.id]: undefined }));
-      setRelances((prev) => ({ ...prev, [b.id]: [] }));
-      setLastAnalysisAt(null);
-      return;
-    }
-
-    const currentHash = makeBlockHash(b);
-    if (cached.hash === currentHash) {
-      setChecklists((prev) => ({ ...prev, [b.id]: cached.checklist || {} }));
-      setRelances((prev) => ({ ...prev, [b.id]: cached.relances || [] }));
-      setLastAnalysisAt(cached.updatedAt || null);
-    } else {
-      // hash différent → invalide la vue pour déclencher auto-analyse
-      setChecklists((prev) => ({ ...prev, [b.id]: undefined }));
-      setRelances((prev) => ({ ...prev, [b.id]: [] }));
-      setLastAnalysisAt(null);
-    }
-  }, [active?.id]);
-
-  // ⚡ Auto-analyse à l’ouverture/au changement de bloc si pas de cache valide
-  useEffect(() => {
-    const b = active as any;
-    if (!b?.id) return;
-    const toAnalyze = checklists[b.id] === undefined; // undefined = pas de cache valide
-    if (toAnalyze && !analyzing) {
-      analyzeActiveNow();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active?.id, checklists, analyzing]);
-
-  async function analyzeActiveNow() {
-    const b = active as any;
-    if (!b) return;
-    const raw = (schemaJson as any)?.[b.id];
-    if (!raw) return;
-
-    // Derive slots ici (mêmes ids que l’UI)
-    const slots = Array.isArray(raw.slots) && raw.slots.length
-      ? raw.slots
-      : Array.isArray(raw.must_have)
-        ? raw.must_have.map((label: string) => ({
-            id: String(label || "")
-              .toLowerCase()
-              .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-              .replace(/[^a-z0-9]+/g, "_")
-              .replace(/^_+|_+$/g, "")
-              .slice(0, 64),
-            label,
-          }))
-        : [];
-
+  async function handleImportAllFromFile(file: File) {
     try {
-      setAnalyzing(true);
-      const res = await fetch("/api/llm/gaps", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          blockId: b.id,
-          entries: b.entries || [],
-          content: b.content || "",       // <— on envoie le récit brut
-          schema: raw,
-          slots,                          // <— on envoie les slots alignés
-        }),
-      });
-      const json = await res.json().catch(() => ({}));
-      if (res.ok && json?.ok) {
-        setChecklists((prev) => ({ ...prev, [b.id]: json.checklist || {} }));
-        if (Array.isArray(json.relances)) {
-          setRelances((prev) => ({ ...prev, [b.id]: json.relances }));
-        }
-        // ★ Sauvegarde cache
-        const payload = {
-          checklist: json.checklist || {},
-          progress: typeof json.progress === "number" ? json.progress : 0,
-          relances: Array.isArray(json.relances) ? json.relances : [],
-          hash: makeBlockHash(b),
-          updatedAt: Date.now(),
-        } as CachedAnalysis;
-        saveCachedAnalysis(b.id, payload);
-        setLastAnalysisAt(payload.updatedAt);
-      }
-    } catch {
-      // no-op UI
-    } finally {
-      setAnalyzing(false);
+      const text = await file.text();
+      const json = JSON.parse(text);
+
+      // validation légère
+      const rawBlocks =
+        (json && typeof json === "object" && json.blocks && typeof json.blocks === "object"
+          ? json.blocks
+          : json) ?? {};
+
+      await importBlocks(rawBlocks);
+      alert("Import réussi. Les blocs ont été remplacés.");
+    } catch (e: any) {
+      alert(`Échec d’import: ${e?.message || "fichier invalide"}`);
     }
   }
 
-  const activeChecklist = active ? checklists[(active as any).id] : undefined;
-  const activeRelances = active ? relances[(active as any).id] : undefined;
-
-  // ★ Jauge locale (ne remplace rien)
-  const progressView = active
-    ? computeProgressLocal((active as any).id, activeChecklist)
-    : { pct: 0, present: 0, total: 0 };
-
-  // ===== Import / Export =====
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-
-  const handleExport = () => {
-    try {
-      const payload = {
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        data: blocks || {},
-      };
-      downloadText(`memosphere-${yyyymmdd_hhmm()}.json`, JSON.stringify(payload, null, 2));
-    } catch (e) {
-      console.error("[export] error:", e);
-      alert("Export impossible.");
-    }
-  };
-
-  const handleImportClick = () => {
+  function triggerImport() {
     fileInputRef.current?.click();
-  };
+  }
 
-  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = ""; // reset pour permettre ré-import du même fichier
-    if (!file) return;
+  useEffect(() => {
     try {
-      const text = await file.text();
-      let json: any;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        alert("Fichier invalide (JSON mal formé).");
-        return;
+      const sid = ensureAgentSessionId();
+      setSessionId(sid);
+    } catch {
+      setSessionId("ms-server");
+    }
+  }, []);
+
+  const items = useMemo(
+  () => (blocks ? (Object.values(blocks) as BlockWithOrder[]) : []),
+  [blocks]
+);
+
+const sorted = useMemo(() => {
+  return items.slice().sort((a, b) => {
+    const oa = (a.order ?? ORDER[a.id] ?? 0);
+    const ob = (b.order ?? ORDER[b.id] ?? 0);
+    if (oa !== ob) return oa - ob;
+    return (a.progress ?? 0) - (b.progress ?? 0);
+  });
+}, [items]);
+
+  async function verifyWithAgent(blockId: string) {
+  try {
+    const b = blocks?.[blockId] as (BlockWithOrder & any) | undefined;
+    const lastAnswer =
+      (b?.entries?.length ? (b!.entries[b!.entries.length - 1] as any).a : "") || "";
+
+    // aplatit le profil canonique { field: {value,source} } -> { field: value }
+    const canonical = Object.fromEntries(
+      Object.entries(b?.resolved ?? {}).map(([k, v]: any) => [k, (v?.value ?? "").toString()])
+    );
+
+    const locks = (b?.locks ?? {});
+
+    const res = await fetch("/api/llm/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        blockId,
+        section: blockId,
+        canonical,
+        locks,
+        lastAnswer,
+      }),
+    });
+
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json) {
+      setAgentNote((m) => ({ ...m, [blockId]: "Agent indisponible (validate)." }));
+      return;
+    }
+
+    const follow =
+      typeof json.followup === "string" && json.followup.trim()
+        ? json.followup.trim()
+        : "(pas de follow-up proposé)";
+    const missing =
+      Array.isArray(json.missing) && json.missing.length
+        ? `Champs manquants: ${json.missing.join(", ")}`
+        : "Aucun champ manquant détecté";
+
+    setAgentNote((m) => ({
+      ...m,
+      [blockId]: `${follow}\n${missing}`,
+    }));
+  } catch (e: any) {
+    setAgentNote((m) => ({ ...m, [blockId]: `Erreur: ${e?.message || "réseau"}` }));
+  }
+}
+
+  // Chat libre: profil aplati pour l'agent et envoi d'un tour
+  function currentProfileFor(blockId: string): Record<string, string> {
+    const b = blocks?.[blockId];
+    const resolved = (b?.resolved ?? {}) as Record<string, { value?: string }>;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(resolved)) {
+      const val = String((v as any)?.value ?? "").trim();
+      if (val) out[k] = val;
+    }
+    return out;
+  }
+
+  async function sendChat(blockId: string) {
+    const text = (chatDrafts[blockId] ?? "").trim();
+    if (!text) return;
+    setChat((m) => ({ ...m, [blockId]: [ ...(m[blockId] || []), { role: "user", text, ts: Date.now() } ] }));
+    setChatSending((m) => ({ ...m, [blockId]: true }));
+    setChatDrafts((m) => ({ ...m, [blockId]: "" }));
+    try { await addTextEntry(blockId, "Chat", text); } catch {}
+    try {
+      // Isoler la session par bloc pour éviter les fuites de contexte
+      const chatSessionId = `${sessionId || "ms"}::${blockId}`;
+      const res = await fetch("/api/agent/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          sectionId: blockId,
+          sessionId: chatSessionId,
+          profile: {},
+          depthBudget: 2,
+          mode: "free",
+          avoidSchema: true,
+        }),
+      });
+      const json = await res.json().catch(() => ({}));
+      let say = typeof json?.say === "string" ? String(json.say).trim() : "";
+      if (!say) {
+        // Fallback libre local pour éviter tout guidage schema
+        const teaser = text.length > 120 ? `${text.slice(0, 120)}…` : text;
+        say = `Tu mentionnes « ${teaser} ». Peux-tu développer librement, avec un exemple concret, un moment précis, et ce que tu as ressenti ?`;
       }
-      const data = json?.data || json; // tolère export brut
-      if (!data || typeof data !== "object") {
-        alert("Fichier invalide (pas de champ data).");
-        return;
+      if (say) {
+        setChat((m) => ({ ...m, [blockId]: [ ...(m[blockId] || []), { role: "assistant", text: say, ts: Date.now() } ] }));
       }
-      await importBlocks(data); // remplace les blocs + persiste
-      // Invalide le cache d’analyse local (pour toutes les ids présentes)
+      const patchRaw = json?.patch && typeof json.patch === "object" ? (json.patch as Record<string, any>) : null;
+      if (patchRaw) {
+        const payload: Record<string, { value: string; source?: string }> = {};
+        for (const [k, v] of Object.entries(patchRaw)) {
+          let val = "";
+          if (typeof v === "string") val = v; else if (typeof v === "number" || typeof v === "boolean") val = String(v);
+          else if (Array.isArray(v)) val = v.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
+          else if (v && typeof v === "object") { if (typeof (v as any).value === "string") val = (v as any).value; else if (typeof (v as any).text === "string") val = (v as any).text; else if (typeof (v as any).label === "string") val = (v as any).label; else { try { val = JSON.stringify(v); } catch { val = String(v); } } }
+          else { val = String(v ?? ""); }
+          payload[String(k)] = { value: val, source: "agent_chat" };
+        }
+        if (Object.keys(payload).length) {
+          try {
+            await setResolved(blockId, payload);
+            for (const key of Object.keys(payload)) { try { await cleanupConflictsFor(blockId, key); } catch {} }
+          } catch {}
+        }
+      }
+    } catch {}
+    finally {
+      setChatSending((m) => ({ ...m, [blockId]: false }));
+    }
+  }
+
+
+  async function handleResetAll() {
+    const ok = confirm(
+      "Tout réinitialiser ? Cela efface les blocs locaux ET remet à zéro la mémoire de l’agent."
+    );
+    if (!ok) return;
+
+    try {
+      await clearAll();
+      clearDraftStorage();
       try {
-        Object.keys(data).forEach((id) => {
-          localStorage.removeItem(`gaps_cache_${id}`);
+        await fetch("/api/agent/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
         });
       } catch {}
-      alert("Import terminé ✅");
-      // force une “réouverture” logique du bloc actif pour ré-hydrater
-      setActiveId((prev) => (prev ? "" : prev));
-      setTimeout(() => setActiveId((active as any)?.id ?? ""), 0);
-    } catch (err) {
-      console.error("[import] error:", err);
-      alert("Import impossible.");
+      const newSid = `ms-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+      localStorage.setItem("agent_session_id", newSid);
+      setSessionId(newSid);
+    } finally {
+      location.reload();
     }
-  };
+  }
+
+  function setDraft(blockId: string, text: string) {
+    setDraftSummaries((m) => ({ ...m, [blockId]: text }));
+    setSaveState((m) => ({ ...m, [blockId]: "saving" }));
+
+    // debounce 600ms
+    if (saveTimers.current[blockId]) {
+      clearTimeout(saveTimers.current[blockId]);
+    }
+    saveTimers.current[blockId] = setTimeout(async () => {
+      try {
+        await setSummary(blockId, text.trim());
+        setSaveState((m) => ({ ...m, [blockId]: "saved" }));
+      } catch {
+        setSaveState((m) => ({ ...m, [blockId]: "idle" }));
+      }
+    }, 600);
+  }
+
+  async function generateSummary(blockId: string) {
+    const b = blocks?.[blockId];
+    // Inclut les entrées textuelles ET les faits canoniques (resolved)
+    const entries: { q: string; a: string }[] = [
+      // Entrées Q/A
+      ...((b?.entries || [])
+        .filter((e: Entry) => e.type === "texte")
+        .map((e: any) => ({ q: String(e?.q || ""), a: String(e?.a || "") }))
+      ),
+      // Faits canoniques (ex: "nom_prenom" -> "Nom prenom")
+      ...Object.entries((b as any)?.resolved || {})
+        .map(([k, v]: any) => ({
+          q: String(k || "").replace(/_/g, " ").trim(),
+          a: String((v?.value ?? "")).trim(),
+        }))
+        .filter((p) => p.a.length > 0),
+    ];
+
+    setSaveState((m) => ({ ...m, [blockId]: "saving" }));
+    try {
+      const res = await fetch("/api/llm/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entries, lang: "fr", style: "biographique" }),
+      });
+      const json = await res.json().catch(() => ({}));
+      const text = json?.ok && typeof json.text === "string" ? json.text : "";
+      setDraftSummaries((m) => ({ ...m, [blockId]: text }));
+      await setSummary(blockId, text);
+      setSaveState((m) => ({ ...m, [blockId]: "saved" }));
+    } catch {
+      setSaveState((m) => ({ ...m, [blockId]: "idle" }));
+      alert("Échec de génération du résumé.");
+    }
+  }
+
+  async function proposeCorrections(blockId: string) {
+  const b = blocks?.[blockId];
+  if (!b) return;
+
+  const summaryText = (draftSummaries[blockId] ?? "").trim();
+  if (!summaryText) {
+    alert("Le résumé est vide.");
+    return;
+  }
+
+  // ⚠️ Aplatir le profil canonique -> { field: "value" }
+  const currentResolved = (b as any).resolved || {};
+  const currentFlat: Record<string, string> = Object.fromEntries(
+    Object.entries(currentResolved).map(([k, v]: any) => [
+      k,
+      (v && typeof v === "object" && "value" in v && v.value != null) ? String(v.value) : String(v ?? ""),
+    ])
+  );
+
+  setRecon(blockId, { loading: true });
+  try {
+    const res = await fetch("/api/llm/reconcile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        blockId,
+        summaryText,
+        current: currentFlat, // 🔧 envoyer la version plate
+        // lang: "fr", // <-- si ton endpoint est sensible à la langue, décommente
+      }),
+    });
+
+    const json = await res.json().catch(() => ({}));
+    const items = Array.isArray(json?.proposals) ? (json.proposals as ReconcileItem[]) : [];
+
+    setRecon(blockId, { loading: false, items });
+    if (!items.length) {
+      // Petit feedback utile pour debug côté serveur
+      const reason = typeof json?.reason === "string" && json.reason
+        ? `\nRaison: ${json.reason}`
+        : "";
+      alert("Aucune correction détectée." + reason);
+    }
+  } catch (e) {
+    setRecon(blockId, { loading: false, items: [] });
+    alert("Échec des propositions de correction.");
+  }
+}
+
+
+  async function applyCorrections(blockId: string) {
+    const data = reconcile[blockId];
+    if (!data || !data.items?.length) return;
+
+    const patch: Record<string, { value: string; source?: string }> = {};
+    for (const it of data.items) {
+      if (!it?.field || typeof it.new !== "string") continue;
+      patch[it.field] = { value: it.new, source: "summary_reconcile" };
+    }
+
+    try {
+      await setResolved(blockId, patch);
+      for (const key of Object.keys(patch)) {
+        await cleanupConflictsFor(blockId, key);
+      }
+      setRecon(blockId, { items: [] });
+      alert("Corrections appliquées au profil.");
+    } catch (e) {
+      console.warn("applyCorrections:", e);
+      alert("Échec lors de l’application des corrections.");
+    }
+  }
+
+  useEffect(() => {
+    // initialise les drafts depuis l’état des blocs
+    if (!blocks) return;
+    const next: Record<string, string> = {};
+    for (const id of Object.keys(blocks)) {
+      next[id] = (blocks[id].summary || "").toString();
+    }
+    setDraftSummaries(next);
+  }, [blocks]);
 
   if (loading) return <div className="p-6">Chargement…</div>;
-  if (!list.length) return <div className="p-6">Aucun bloc.</div>;
+  if (!blocks) {
+    return (
+      <main className="max-w-4xl mx-auto p-6">
+        <header className="flex items-center justify-between mb-4">
+          <h1 className="text-2xl font-semibold">Blocs</h1>
+          <div className="flex items-center gap-2">
+            <Link href="/interview" className="text-sm text-blue-600 hover:underline">
+              → Ouvrir l’interview
+            </Link>
+            <button
+              className="text-sm px-3 py-1.5 border rounded hover:bg-red-50"
+              onClick={handleResetAll}
+              title="Réinitialise les blocs ET la mémoire de l’agent"
+            >
+              Réinitialiser (données + agent)
+            </button>
+          </div>
+        </header>
+        <div className="text-xs text-gray-500 mb-3">
+          Session agent : <code className="px-1 py-0.5 bg-gray-100 rounded">{sessionId || "…"}</code>
+        </div>
+        <div className="p-6 border rounded-xl bg-white">Aucun bloc.</div>
+      </main>
+    );
+  }
+
+  const sortedList = sorted;
 
   return (
     <main className="max-w-5xl mx-auto p-6 space-y-6">
-      <header className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={() => router.push("/interview")}
-            className="text-sm border rounded-lg px-3 py-2 bg-white hover:bg-gray-50"
-            title="Retourner à l’interview"
-          >
-            ← Revenir à l’interview
-          </button>
+      <header className="flex items-center justify-between">
+  <h1 className="text-2xl font-semibold">Blocs</h1>
+  <div className="flex items-center gap-2">
+    <Link
+      href={`/interview?sessionId=${encodeURIComponent(sessionId)}`}
+      className="text-sm text-blue-600 hover:underline"
+    >
+      → Ouvrir l’interview
+    </Link>
+    <Link
+      href="/draft"
+      className="text-sm text-blue-600 hover:underline"
+    >
+      → Voir le Draft
+    </Link>
+    <button
+      className="text-sm px-3 py-1.5 border rounded hover:bg-red-50"
+      onClick={handleResetAll}
+      title="Réinitialise les blocs ET la mémoire de l’agent"
+    >
+      Réinitialiser (données + agent)
+    </button>
+  </div>
+</header>
 
-          {/* Import / Export */}
-          <button
-            type="button"
-            onClick={handleExport}
-            className="text-sm border rounded-lg px-3 py-2 bg-white hover:bg-gray-50"
-            title="Exporter tous les blocs en JSON"
-          >
-            Exporter JSON
-          </button>
-          <button
-            type="button"
-            onClick={handleImportClick}
-            className="text-sm border rounded-lg px-3 py-2 bg-white hover:bg-gray-50"
-            title="Importer des blocs depuis un JSON"
-          >
-            Importer JSON
-          </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="application/json,.json"
-            className="hidden"
-            onChange={handleImportFile}
-          />
-
-          <h1 className="text-2xl font-semibold ml-2">Blocs</h1>
+      {/* BARRE EXPORT / IMPORT GLOBALE */}
+      <section className="border rounded-xl bg-white p-4 flex flex-wrap items-center gap-3">
+        <div className="text-xs text-gray-500 mr-auto">
+          Session agent :{" "}
+          <code className="px-1 py-0.5 bg-gray-100 rounded">{sessionId || "…"}</code>
         </div>
 
         <button
-          type="button"
-          onClick={() => setConfirmOpen(true)}
-          className="text-sm border rounded-lg px-3 py-2 bg-white hover:bg-gray-50"
-          title="Réinitialiser tous les blocs"
+          className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+          onClick={handleExportAll}
+          title="Télécharge un JSON contenant tous les blocs"
         >
-          Réinitialiser
+          Exporter tout (JSON)
         </button>
-      </header>
 
-      {confirmOpen && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="reset-title"
-          className="fixed inset-0 bg-black/40 grid place-items-center z-50"
-          onKeyDown={(e) => { if (e.key === 'Escape') setConfirmOpen(false); }}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/json,.json"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) {
+              handleImportAllFromFile(f).finally(() => {
+                if (fileInputRef.current) fileInputRef.current.value = "";
+              });
+            }
+          }}
+        />
+        <button
+          className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+          onClick={triggerImport}
+          title="Remplace les données locales par un JSON exporté"
         >
-          <div className="bg-white rounded-xl p-5 w-[min(520px,92vw)] shadow-xl">
-            <h2 id="reset-title" className="text-lg font-semibold">Réinitialiser tous les blocs ?</h2>
-            <p className="text-sm text-gray-600 mt-2">
-              Cette action efface les contenus saisis et les brouillons locaux. Elle est <strong>irréversible</strong>.
-            </p>
-            <div className="flex justify-end gap-3 mt-4">
-              <button
-                onClick={() => setConfirmOpen(false)}
-                disabled={busyReset}
-                className="text-sm border rounded-lg px-3 py-2 bg-white hover:bg-gray-50"
-              >
-                Annuler
-              </button>
-              <button
-                onClick={async () => {
-                  setBusyReset(true);
-                  try {
-                    try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch {}
-                    await clearAll();
-                    // vide caches d’analyse
-                    try {
-                      if (blocks) {
-                        Object.keys(blocks).forEach((id) => {
-                          localStorage.removeItem(`gaps_cache_${id}`);
-                        });
-                      }
-                    } catch {}
-                    setChecklists({});
-                    setRelances({});
-                    setLastAnalysisAt(null);
-                    setConfirmOpen(false);
-                  } finally {
-                    setBusyReset(false);
-                  }
-                }}
-                disabled={busyReset}
-                className="text-sm rounded-lg px-3 py-2 bg-red-600 text-white hover:bg-red-700"
-              >
-                {busyReset ? 'Réinitialisation…' : 'Oui, tout effacer'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Sélecteur de bloc */}
-      <section className="
-        border rounded-xl p-4 bg-white
-        flex items-center gap-3
-      ">
-        <div className="text-xs uppercase tracking-wide text-gray-500">Sélection</div>
-        <select
-          className="border rounded p-2 text-sm"
-          value={(active as any)?.id ?? ""}
-          onChange={(e) => setActiveId(e.target.value)}
-        >
-          {list.map((b: Block) => (
-            <option key={(b as any).id} value={(b as any).id}>
-              {(b as any).title}
-            </option>
-          ))}
-        </select>
+          Importer JSON…
+        </button>
       </section>
 
-      {active && (
-        <>
-          {/* En-tête : titre éditable */}
-          <section className="space-y-2 border rounded-xl p-4 bg-white">
-            <div className="text-xs uppercase tracking-wide text-gray-500">
-              Titre du bloc
-            </div>
-            <div className="flex gap-2">
-              <input
-                className="flex-1 border rounded p-2 text-sm"
-                value={titleDraft}
-                onChange={(e) => setTitleDraft(e.target.value)}
-              />
-              <button
-                className="px-3 py-2 border rounded text-sm hover:bg-gray-50"
-                onClick={async () => {
-                  const t = (titleDraft || "").trim();
-                  if (!t || t === active.title) return;
-                  await renameBlock((active as any).id, t);
-                }}
-              >
-                Renommer
-              </button>
-            </div>
-          </section>
+  <section>
+        <div className="grid grid-cols-12 gap-0 px-4 py-3 text-xs font-medium text-gray-500 bg-gray-50">
+          <div className="col-span-3">Bloc</div>
+          <div className="col-span-2">Progression</div>
+          <div className="col-span-1">Entrées</div>
+          <div className="col-span-6 text-right">Actions</div>
+        </div>
 
-          {/* Objectifs du bloc (Agent de complétude) */}
-          <section className="space-y-2 border rounded-xl p-4 bg-white">
-            <div className="flex items-center justify-between">
-              <div className="text-xs uppercase tracking-wide text-gray-500">
-                Objectifs du bloc
+        <ul className="space-y-6">
+          {sortedList.map((b) => (
+            <li key={b.id} className="p-4 border-2 rounded-lg bg-white shadow-sm">
+
+              <div className="grid grid-cols-12 items-start gap-4">
+  {/* Titre du bloc */}
+  <div className="col-span-3 flex flex-col justify-start">
+    <h2 className="text-xl font-bold text-gray-800 leading-tight">{b.title}</h2>
+    <div className="h-[3px] w-2/3 bg-gradient-to-r from-orange-400 via-pink-500 to-purple-500 rounded-full shadow-sm"></div>
+
+
+  </div>
+
+                {/* Barre de progression */}
+  <div className="col-span-2">
+  <div className="relative w-full bg-gray-100 rounded h-2 overflow-hidden">
+    <div
+      className="bg-indigo-500 h-2 transition-all duration-300"
+      style={{ width: `${Math.max(0, Math.min(100, b.progress ?? 0))}%` }}
+    />
+  </div>
+  <div className="text-xs text-gray-600 mt-1 pl-2">{b.progress ?? 0}%</div>
+</div>
+  
+  
+                <div className="col-span-1 text-xs text-gray-700 pt-1">
+                  {b.entries?.length ?? 0}
+                </div>
+
+                <div className="col-span-6 flex items-center justify-end gap-2">
+                  <Link
+                    href={`/interview?block=${encodeURIComponent(b.id)}&sessionId=${encodeURIComponent(
+                      sessionId
+                    )}`}
+                    className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                  >
+                    Ouvrir l’interview
+                  </Link>
+                  <Link
+  href={`/blocks/${encodeURIComponent(b.id)}`}
+  className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+  title="Éditer le bloc"
+>
+  Éditer
+</Link>
+
+                  <button
+                    onClick={() => verifyWithAgent(b.id)}
+                    className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                    title="Aperçu agent (follow-up + champs manquants)"
+                  >
+                    Vérifier avec l’agent
+                  </button>
+                </div>
               </div>
-              <div className="flex items-center gap-4">
-                {lastAnalysisAt && (
-                  <div className="text-[11px] text-gray-400">
-                    analysé le {new Date(lastAnalysisAt).toLocaleString()}
-                  </div>
-                )}
-                <button
-                  className="px-3 py-2 border rounded text-sm hover:bg-gray-50"
-                  onClick={analyzeActiveNow}
-                  disabled={analyzing}
-                >
-                  {analyzing ? "Analyse en cours…" : "Analyser maintenant"}
-                </button>
-                {/* ★ Jauge de complétude */}
-                <div className="hidden sm:flex flex-col items-end gap-1 min-w-[160px]">
+
+              {/* Résumé éditable + générer + reconcile + profil + export */}
+              <div className="mt-3 grid grid-cols-12 gap-3">
+                <div className="col-span-12">
+                  {/* Chat libre */}
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="text-sm font-medium">Chat libre</div>
                   <div className="text-xs text-gray-500">
-                    Complétude&nbsp;: <span className="font-medium">{progressView.pct}%</span>
-                    {progressView.total > 0 && (
-                      <span className="text-gray-400"> &nbsp;({progressView.present}/{progressView.total})</span>
-                    )}
+                      {chatSending[b.id] ? "Envoi..." : (sttStatus[b.id] || "")}
+                    </div>
                   </div>
-                  <div className="w-full h-2 rounded bg-gray-100 overflow-hidden border border-gray-200">
-                    <div
-                      className="h-2 rounded bg-indigo-500 transition-[width] duration-300"
-                      style={{ width: `${Math.min(100, Math.max(0, progressView.pct))}%` }}
-                    />
-                  </div>
-                </div>
-              </div>
-            </div>
-            <ChecklistChipsLocal blockId={(active as any).id} checklist={activeChecklist} />
 
-            {Array.isArray(activeRelances) && activeRelances.length > 0 && (
-              <div className="mt-3">
-                <div className="text-xs uppercase tracking-wide text-gray-500">Relances suggérées</div>
-                <ul className="mt-1 list-disc list-inside text-sm text-gray-700">
-                  {activeRelances.map((r: any, i: number) => (
-                    <li key={i}>
-                      <span className="font-medium">{r?.question || "…"} </span>
-                      <span className="text-xs text-gray-500">
-                        {r?.slotId ? `(${r.slotId})` : ""} {typeof r?.priority === "number" ? `• prio ${r.priority}` : ""}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </section>
-
-          {/* Résumé (IA) */}
-          <section className="space-y-2 border rounded-xl p-4 bg-white">
-            <div className="flex items-center justify-between">
-              <div className="text-xs uppercase tracking-wide text-gray-500">
-                Résumé (IA)
-              </div>
-              <div className="flex items-center gap-2">
-                {/* Annuler / Rétablir / Revenir à la version enregistrée */}
-                <button
-                  className="px-2 py-2 border rounded text-sm hover:bg-gray-50 disabled:opacity-50"
-                  onClick={summaryMgr.undo}
-                  disabled={!summaryMgr.canUndo()}
-                  title="Annuler la dernière modification"
-                >
-                  ⟲ Annuler
-                </button>
-                <button
-                  className="px-2 py-2 border rounded text-sm hover:bg-gray-50 disabled:opacity-50"
-                  onClick={summaryMgr.redo}
-                  disabled={!summaryMgr.canRedo()}
-                  title="Rétablir"
-                >
-                  ⟳ Rétablir
-                </button>
-                <button
-                  className="px-2 py-2 border rounded text-sm hover:bg-gray-50"
-                  onClick={summaryMgr.revertToSaved}
-                  title="Revenir à la dernière version enregistrée"
-                >
-                  ⏮ Revenir à la version enregistrée
-                </button>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between">
-              <p className="text-xs text-gray-500">
-                Génère un résumé court du bloc actif.
-              </p>
-              <div className="flex items-center gap-2">
-                <button
-                  className="px-3 py-2 border rounded text-sm hover:bg-gray-50"
-                  onClick={async () => {
-                    try {
-                      const txt = await summarizeBlockLLM(active);
-                      if (typeof txt === "string") {
-                        summaryMgr.reset(txt);
-                        await setSummary((active as any).id, txt);
-                      }
-                    } catch {}
-                  }}
-                >
-                  Résumer via IA
-                </button>
-                <div className="text-xs">
-                  {summarySaveState === "saving" && <span className="text-gray-500">Enregistrement…</span>}
-                  {summarySaveState === "saved" && <span className="text-green-600">Enregistré ✓</span>}
-                  {summarySaveState === "idle" && <span className="text-gray-400">—</span>}
-                </div>
-              </div>
-            </div>
-
-            <textarea
-              className="w-full border rounded p-3 text-sm bg-gray-50"
-              rows={6}
-              placeholder="Un petit résumé propre, factuel, 3–5 phrases…"
-              value={summaryMgr.value}
-              onChange={(e) => summaryMgr.onChange(e.target.value)}
-            />
-          </section>
-
-          {/* Mémoire (brut) */}
-          <section className="space-y-2 border rounded-xl p-4 bg-white">
-            <div className="flex items-center justify-between">
-              <div className="text-xs uppercase tracking-wide text-gray-500">
-                Mémoire (brut)
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  className="px-2 py-1 border rounded text-xs hover:bg-gray-50 disabled:opacity-50"
-                  onClick={contentMgr.undo}
-                  disabled={!contentMgr.canUndo()}
-                  title="Annuler la dernière modification"
-                >
-                  ⟲ Annuler
-                </button>
-                <button
-                  className="px-2 py-1 border rounded text-xs hover:bg-gray-50 disabled:opacity-50"
-                  onClick={contentMgr.redo}
-                  disabled={!contentMgr.canRedo()}
-                  title="Rétablir"
-                >
-                  ⟳ Rétablir
-                </button>
-                <button
-                  className="px-2 py-1 border rounded text-xs hover:bg-gray-50"
-                  onClick={contentMgr.revertToSaved}
-                  title="Revenir à la dernière version enregistrée"
-                >
-                  ⏮ Version enregistrée
-                </button>
-                <div className="text-xs ml-2">
-                  {contentSaveState === "saving" && <span className="text-gray-500">Enregistrement…</span>}
-                  {contentSaveState === "saved" && <span className="text-green-600">Enregistré ✓</span>}
-                  {contentSaveState === "idle" && <span className="text-gray-400">—</span>}
-                </div>
-              </div>
-            </div>
-
-            <textarea
-              className="w-full border rounded p-3 text-sm bg-gray-50"
-              rows={12}
-              placeholder="Édite librement le récit du bloc…"
-              value={contentMgr.value}
-              onChange={(e) => contentMgr.onChange(e.target.value)}
-            />
-          </section>
-
-          {/* Historique Q/R (compat) */}
-          <section className="space-y-2 border rounded-xl p-4 bg-white">
-            <div className="text-xs uppercase tracking-wide text-gray-500">
-              Historique (Q/R)
-            </div>
-            {!active.entries?.length ? (
-              <p className="text-sm text-gray-500">Aucune entrée.</p>
-            ) : (
-              <ul className="space-y-2">
-                {active.entries.map((e: Entry, idx: number) => (
-                  <li key={idx} className="bg-gray-50 border rounded p-2">
-                    {e.type === "texte" && (
-                      <div className="text-xs text-gray-700">
-                        <div><span className="font-medium">Q:&nbsp;</span>{(e as any).q}</div>
-                        <div><span className="font-medium">A:&nbsp;</span>{(e as any).a}</div>
+                  {(openChat[b.id] ?? true) && (
+                    <div className="space-y-2 mb-2">
+                      <div className="max-h-48 overflow-auto border rounded p-2 bg-white/50">
+                        {(chat[b.id]?.length ? (
+                          (chat[b.id] || []).map((m, idx) => (
+                            <div key={idx} className={`flex ${m.role === "assistant" ? "justify-start" : "justify-end"} mb-1`}>
+                              <div
+                                className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm shadow ${
+                                  m.role === "assistant" ? "bg-indigo-50 text-indigo-900" : "bg-gray-100 text-gray-900"
+                                }`}
+                              >
+                                {m.text}
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="text-xs text-gray-500">Lance un sujet pour ce bloc.</div>
+                        ))}
                       </div>
+
+                      <div className="space-y-2 w-full">
+  <div className="flex items-center justify-start gap-2 mb-1">
+    <span className="text-xs text-gray-600 font-medium">Mode :</span>
+    <button
+      onClick={() => setChatMode((m) => ({ ...m, [b.id]: "text" }))}
+      className={`text-xs px-2 py-1 border rounded ${
+        (chatMode[b.id] ?? "text") === "text" ? "bg-gray-100" : ""
+      }`}
+    >
+      Texte
+    </button>
+    <button
+      onClick={() => setChatMode((m) => ({ ...m, [b.id]: "voice" }))}
+      className={`text-xs px-2 py-1 border rounded ${
+        chatMode[b.id] === "voice" ? "bg-gray-100" : ""
+      }`}
+    >
+      Voix
+    </button>
+  </div>
+
+  {(chatMode[b.id] ?? "text") === "text" ? (
+    <div className="flex items-center flex-wrap gap-2">
+      <input
+        className="flex-1 border rounded p-2 text-sm"
+        placeholder="Lancer un sujet ou répondre..."
+        value={chatDrafts[b.id] ?? ""}
+        onChange={(e) =>
+          setChatDrafts((m) => ({ ...m, [b.id]: e.target.value }))
+        }
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            sendChat(b.id);
+          }
+        }}
+      />
+      <button
+        className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+        onClick={() => sendChat(b.id)}
+        disabled={!chatDrafts[b.id]?.trim() || !!chatSending[b.id]}
+        title="Envoyer au chat"
+      >
+        Envoyer
+      </button>
+    </div>
+  ) : (
+    <VoiceChatControls
+      value={chatDrafts[b.id] ?? ""}
+      onChange={(t) =>
+        setChatDrafts((m) => ({ ...m, [b.id]: t }))
+      }
+      onValidate={() => sendChat(b.id)}
+    />
+  )}
+</div>
+
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="text-sm font-medium">Résumé</div>
+                    <div className="text-xs text-gray-500">
+                      {saveState[b.id] === "saving"
+                        ? "Enregistrement…"
+                        : saveState[b.id] === "saved"
+                        ? "Enregistré"
+                        : "—"}
+                    </div>
+                  </div>
+
+                  <textarea
+                    className="w-full border rounded p-3 text-sm bg-white"
+                    rows={4}
+                    placeholder="Résumé éditable du bloc…"
+                    value={draftSummaries[b.id] ?? ""}
+                    onChange={(e) => setDraft(b.id, e.target.value)}
+                  />
+
+                  <div className="flex items-center flex-wrap gap-2 mt-2">
+                    <button
+                      className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                      onClick={() => generateSummary(b.id)}
+                      title="Génère (ou régénère) le résumé à partir des entrées du bloc"
+                    >
+                      Générer
+                    </button>
+
+                    <button
+                      className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                      onClick={() => proposeCorrections(b.id)}
+                      disabled={!draftSummaries[b.id]?.trim()}
+                      title="Analyse le résumé pour repérer des corrections crédibles"
+                    >
+                      Proposer corrections
+                    </button>
+
+                    <button
+                      className="px-3 py-1.5 border rounded text-sm hover:bg-green-50"
+                      onClick={() => applyCorrections(b.id)}
+                      disabled={!(reconcile[b.id]?.items?.length)}
+                      title="Applique les corrections au profil canonique"
+                    >
+                      Appliquer au profil
+                    </button>
+
+                    <button
+                      className="px-2 py-1.5 border rounded text-xs hover:bg-gray-50"
+                      onClick={() => toggleCanon(b.id)}
+                      title="Afficher/Masquer le profil canonique du bloc"
+                    >
+                      {showCanon[b.id] ? "Masquer profil" : "Voir profil"}
+                    </button>
+
+                    <button
+                      className="px-2 py-1.5 border rounded text-xs hover:bg-gray-50"
+                      onClick={() => downloadJson(`${b.id}.json`, b)}
+                      title="Exporter le bloc en JSON"
+                    >
+                      Exporter JSON
+                    </button>
+
+                    {reconcile[b.id]?.loading && (
+                      <span className="text-xs text-gray-500">Analyse en cours…</span>
                     )}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-        </>
-      )}
+
+                    {agentNote[b.id] && (
+                      <span className="text-xs text-indigo-700 bg-indigo-50 px-2 py-1 rounded">
+                        {agentNote[b.id]}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Liste des propositions */}
+                  {reconcile[b.id]?.items?.length > 0 && (
+                    <div className="mt-2 text-sm border rounded p-2 bg-indigo-50 text-indigo-900">
+                      <div className="font-medium mb-1">Propositions détectées :</div>
+                      <ul className="list-disc pl-5 space-y-1">
+                        {reconcile[b.id].items.map((it, idx) => (
+                          <li key={idx}>
+                            <code>{it.field}</code>: <s>{it.old ?? "-"}</s>{' -> '}<b>{it.new}</b>
+                            {typeof it.confidence === "number" && (
+                              <span className="ml-2 text-xs opacity-80">
+                                ({Math.round(it.confidence * 100)}%)
+                              </span>
+                            )}
+                            {it.reason && (
+                              <span className="ml-2 text-xs opacity-80">— {it.reason}</span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* Profil canonique du bloc */}
+                  {showCanon[b.id] && (
+                    <div className="mt-3 text-sm border rounded p-3 bg-gray-50">
+                      <div className="font-medium mb-2">
+                        Profil canonique (valeurs consolidées)
+                      </div>
+                      {Object.keys((b as any).resolved || {}).length === 0 ? (
+                        <div className="text-xs text-gray-500">
+                          Aucune valeur canonique enregistrée pour ce bloc.
+                        </div>
+                      ) : (
+                        <ul className="space-y-2">
+  {Object.entries(b.resolved || {}).map(([k, v]) => (
+    <li key={k} className="flex flex-col sm:flex-row sm:items-center gap-2 text-sm">
+      <label className="text-xs w-48 font-medium text-gray-600">{k}</label>
+      <input
+        defaultValue={v?.value ?? ""}
+        className="flex-1 border rounded p-2 text-sm"
+        onBlur={async (e) => {
+          const newVal = e.target.value.trim();
+          if (newVal && newVal !== v?.value) {
+            try {
+              await setResolved(b.id, { [k]: { value: newVal, source: "user_edit" } });
+            } catch (err) {
+              console.error("Erreur update resolved:", err);
+            }
+          }
+        }}
+      />
+      <div className="flex items-center gap-2">
+        <div className="text-xs text-gray-400">
+          {v?.source ?? "-"} {v?.at ? `- ${new Date(v.at).toLocaleString()}` : ""}
+        </div>
+        <button
+          className="px-2 py-1 border rounded text-xs hover:bg-red-50 hover:text-red-700"
+          title="Supprimer cette valeur canonique"
+          onClick={async () => {
+            try {
+              await unsetResolved(b.id, k);
+            } catch (err) {
+              console.error("unsetResolved error:", err);
+            }
+          }}
+        >
+          Supprimer
+        </button>
+      </div>
+    </li>
+  ))}
+</ul>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </section>
     </main>
   );
 }
+
+
+
+
+
+
+
+
+
+
+
