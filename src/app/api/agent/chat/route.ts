@@ -3,7 +3,6 @@ import {
   runInterviewTurn,
   consumeLastPatch,
   sectionPhase, // "must" | "good" | "done"
-  getSectionProfile,
 } from "@/server/llm/providers/agentsdk";
 
 export const runtime = "nodejs";
@@ -18,7 +17,7 @@ export async function POST(req: NextRequest) {
   let sec = "unknown";
   try {
     const body = await req.json().catch(() => ({}));
-    const { message = "", sessionId, sectionId, depthBudget, profile } = body || {};
+    const { message = "", sessionId, sectionId, depthBudget } = body || {};
 
     if (typeof sessionId !== "string" || !sessionId) {
       return NextResponse.json({ error: "Missing sessionId (string)" }, { status: 400 });
@@ -36,34 +35,6 @@ export async function POST(req: NextRequest) {
       message: String(message).slice(0, 200),
       depthBudget,
     });
-
-    // Free mode: bypass schema guidance and profiling when requested
-    const freeHeader = req.headers.get("x-free-mode") === "1";
-    const isFree = freeHeader || (body && (body.mode === "free" || body.avoidSchema === true));
-    if (isFree) {
-      const secFree = `${sec}::free`;
-      // Let the agent deepen the user's message without templates/schema
-      const firstTurn: any = await (runInterviewTurn as any)(message, sid, secFree, {
-        depthBudget,
-        mode: "free",
-        avoidSchema: true,
-        nudge: "deepen",
-        noTemplates: true,
-      });
-      const say: string = String(firstTurn?.say ?? "").trim();
-      return NextResponse.json(
-        { say, done: false, phase: "free", patch: null },
-        { headers: { "x-agent-session": sid, "x-agent-section": secFree } }
-      );
-    }
-
-    // Optional: seed the agent's in-memory profile with known values from the client
-    if (profile && typeof profile === "object") {
-      try {
-        const store = getSectionProfile(sid, sec);
-        Object.assign(store, profile);
-      } catch {}
-    }
 
     // --- Appel principal (on passe depthBudget SANS casser la signature existante)
     // Si runInterviewTurn supporte un 4e argument, il sera utilisé ; sinon il sera ignoré.

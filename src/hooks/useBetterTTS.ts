@@ -1,17 +1,17 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useRef, useState } from "react";
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
- * TTS basé sur /api/tts (OpenAI gpt-4o-mini-tts) avec gestion propre:
- * - Séquentialise les lectures (pas de chevauchement),
- * - Evite AbortError (pause/play),
- * - Révoque les blobs,
- * - Gère l'autoplay bloqué (NotAllowedError).
+ * Hook TTS basé sur /api/tts (OpenAI gpt-4o-mini-tts).
+ * - speak(text, voice?) : génère et joue l'audio (remplace l'audio en cours proprement)
+ * - stop() : stoppe la lecture en cours
+ * - loading : génération en cours
+ * - playing : lecture en cours
  */
 export function useBetterTTS(defaultVoice = "alloy") {
   const [loading, setLoading] = useState(false);
@@ -19,10 +19,9 @@ export function useBetterTTS(defaultVoice = "alloy") {
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const urlRef = useRef<string | null>(null);
-  const tokenRef = useRef<number>(0); // anti-course
-  const currentJobRef = useRef<Promise<void> | null>(null);
+  const tokenRef = useRef<number>(0); // anti-course: id de requête
 
-  const cleanup = () => {
+  function cleanupAudio() {
     try {
       const a = audioRef.current;
       if (a) {
@@ -34,9 +33,9 @@ export function useBetterTTS(defaultVoice = "alloy") {
         urlRef.current = null;
       }
     } catch {}
-  };
+  }
 
-  const stop = useCallback(async () => {
+  async function stop() {
     try {
       const a = audioRef.current;
       if (a) {
@@ -45,95 +44,98 @@ export function useBetterTTS(defaultVoice = "alloy") {
       }
     } catch {}
     setPlaying(false);
-    cleanup();
-    await sleep(10);
-  }, []);
+    cleanupAudio();
+  }
 
-  const speak = useCallback(async (text: string, voice?: string) => {
+  async function speak(text: string, voice?: string) {
     const clean = text?.trim();
     if (!clean) return;
 
+    // Invalide toute requête précédente
     const myToken = ++tokenRef.current;
 
-    // stoppe une éventuelle lecture en cours avant d'en lancer une autre
+    // Stoppe proprement l’audio en cours et laisse le navigateur "respirer"
     await stop();
+    await sleep(20); // petit délai pour éviter l'AbortError sur certains navigateurs
 
     setLoading(true);
-    const job = (async () => {
-      try {
-        const res = await fetch("/api/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: clean, voice: voice ?? defaultVoice }),
-        });
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: clean,
+          voice: voice ?? defaultVoice,
+        }),
+      });
 
-        if (!res.ok) {
-          try {
-            const ct = res.headers.get("content-type") || "";
-            if (ct.includes("application/json")) {
-              const err = await res.json();
-              console.error("TTS HTTP error", res.status, err);
-            } else {
-              const txt = await res.text();
-              console.error("TTS HTTP error", res.status, txt.slice(0, 200));
-            }
-          } catch {
-            console.error("TTS HTTP error", res.status);
+      if (!res.ok) {
+        // Log lisible même si ce n’est pas du JSON
+        try {
+          const ct = res.headers.get("content-type") || "";
+          if (ct.includes("application/json")) {
+            const err = await res.json();
+            console.error("TTS HTTP error", res.status, err);
+          } else {
+            const txt = await res.text();
+            console.error("TTS HTTP error", res.status, txt.slice(0, 200));
           }
-          return;
+        } catch {
+          console.error("TTS HTTP error", res.status);
         }
-
-        if (myToken !== tokenRef.current) return;
-
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        urlRef.current = url;
-
-        let audio = audioRef.current;
-        if (!audio) {
-          audio = new Audio();
-          audioRef.current = audio;
-        }
-        audio.src = url;
-
-        audio.onended = () => {
-          setPlaying(false);
-          cleanup();
-        };
-        audio.onerror = () => {
-          setPlaying(false);
-          cleanup();
-        };
-
-        const playPromise = audio.play();
-        if (playPromise && typeof playPromise.then === "function") {
-          await playPromise
-            .then(() => {
-              if (myToken !== tokenRef.current) return;
-              setPlaying(true);
-            })
-            .catch((err: any) => {
-              if (err?.name === "NotAllowedError") {
-                console.warn("[TTS] Lecture bloquée par le navigateur (autoplay). Clic requis (Relire).");
-              } else if (err?.name !== "AbortError") {
-                console.error("audio.play() failed:", err);
-              }
-              setPlaying(false);
-            });
-        } else {
-          setPlaying(true);
-        }
-      } finally {
-        if (myToken === tokenRef.current) setLoading(false);
+        return;
       }
-    })();
 
-    currentJobRef.current = job;
-    await job.catch(() => {});
-    if (myToken === tokenRef.current) {
-      currentJobRef.current = null;
+      // Si une nouvelle speak() est partie entre temps, on abandonne ce résultat
+      if (myToken !== tokenRef.current) return;
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      urlRef.current = url;
+
+      let audio = audioRef.current;
+      if (!audio) {
+        audio = new Audio();
+        audioRef.current = audio;
+      }
+      audio.src = url;
+
+      audio.onended = () => {
+        setPlaying(false);
+        cleanupAudio();
+      };
+      audio.onerror = () => {
+        setPlaying(false);
+        cleanupAudio();
+      };
+
+      // Démarre la lecture avec gestion propre de l'AbortError
+      const playPromise = audio.play();
+if (playPromise && typeof playPromise.then === "function") {
+  playPromise
+    .then(() => {
+      if (myToken !== tokenRef.current) return;
+      setPlaying(true);
+    })
+    .catch((err: any) => {
+      // Autoplay bloqué par le navigateur
+      if (err?.name === "NotAllowedError") {
+        console.warn("[TTS] Lecture bloquée par le navigateur (autoplay). L'utilisateur doit interagir (ex: cliquer).");
+      } else if (err?.name === "AbortError") {
+        // attendu si on stoppe/remplace très vite
+      } else {
+        console.error("audio.play() failed:", err);
+      }
+      setPlaying(false);
+    });
+} else {
+  setPlaying(true);
+}
+          } finally {
+      // Si une autre requête a pris la main, laisser son loading gérer
+      if (myToken === tokenRef.current) setLoading(false);
     }
-  }, [defaultVoice, stop]);
+  }
 
   return { speak, stop, loading, playing };
 }
