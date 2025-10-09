@@ -12,6 +12,34 @@ function looksLikeQuestion(s: string) {
   return !!t && /\?\s*$/.test(t);
 }
 
+// 🔧 Nouveau : wrapper qui enrichit le prompt avec profil + contexte
+async function contextualRunInterviewTurn(
+  message: string,
+  sid: string,
+  sec: string,
+  context: string,
+  profile: Record<string, string>,
+  options: { depthBudget?: number }
+) {
+  // On construit un prompt système avec profil et contexte
+  const sysPrompt = `
+Tu es un agent d'interview biographique.
+Voici les données déjà connues de l'utilisateur (profil structuré) :
+${JSON.stringify(profile, null, 2)}
+
+Voici ce qu’il a déjà raconté :
+${context}
+
+Pose une **nouvelle question**, utile, sans répéter ce qui a déjà été abordé.
+Si tout semble complet, invite à approfondir ou partager une anecdote.
+`.trim();
+
+  // runInterviewTurn peut prendre directement message ou sysPrompt comme entrée
+  // Ici on injecte sysPrompt seulement si message vide
+  const firstMsg = message && message.trim().length > 0 ? message : sysPrompt;
+  return await (runInterviewTurn as any)(firstMsg, sid, sec, options);
+}
+
 export async function POST(req: NextRequest) {
   let sid = "unknown";
   let sec = "unknown";
@@ -29,25 +57,40 @@ export async function POST(req: NextRequest) {
     sid = String(sessionId);
     sec = String(sectionId);
 
+    // 🔧 nouveau : récupérer profil + contexte envoyés par le client
+    const profile = body?.profile ?? {};
+    const context = body?.context ?? "";
+
     console.log("[AGENT IN]", {
       sid,
       sec,
       message: String(message).slice(0, 200),
       depthBudget,
+      profileKeys: Object.keys(profile || {}),
+      contextPreview: String(context).slice(0, 100) + "...",
     });
 
-    // --- Appel principal (on passe depthBudget SANS casser la signature existante)
-    // Si runInterviewTurn supporte un 4e argument, il sera utilisé ; sinon il sera ignoré.
-    const firstTurn: any = await (runInterviewTurn as any)(message, sid, sec, { depthBudget });
+    // --- Appel principal avec contexte enrichi
+    const firstTurn: any = await contextualRunInterviewTurn(
+      message,
+      sid,
+      sec,
+      context,
+      profile,
+      { depthBudget }
+    );
+
     let say: string = firstTurn?.say ?? "";
     let patch = consumeLastPatch(sid, sec);
     let phase = sectionPhase(sid, sec); // "must" | "good" | "done"
     let done = phase === "done";
 
-    // “question guarantee”
+    // “question guarantee” — on redemande si la première sortie n’est pas une question
     let safety = 2;
     while (!done && !looksLikeQuestion(say) && safety > 0) {
-      const again: any = await (runInterviewTurn as any)("", sid, sec, { depthBudget });
+      const again: any = await contextualRunInterviewTurn("", sid, sec, context, profile, {
+        depthBudget,
+      });
       say = again?.say ?? "";
 
       const extraPatch = consumeLastPatch(sid, sec);

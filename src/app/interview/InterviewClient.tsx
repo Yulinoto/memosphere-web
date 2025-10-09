@@ -8,6 +8,7 @@ import DeepgramSTT from "./DeepgramSTT";
 import LiveSTT from "./LiveSTT";
 import schemaJson from "@/data/interviewSchema.json";
 import { useBetterTTS } from "@/hooks/useBetterTTS";
+import { PageNavButtons } from "@/components/ui/PageNavButtons";
 
 type BlockWithOrder = { id: string; progress?: number; order?: number } & any;
 
@@ -354,6 +355,29 @@ useEffect(() => {
     }
     return out;
   }
+
+  function fullContextForAgent(blockId: string): { profile: Record<string, string>; contextText: string } {
+  const b = blocksRef.current?.[blockId];
+  const resolved = (b?.resolved ?? {}) as Record<string, { value?: string }>;
+  const profile: Record<string, string> = {};
+
+  for (const [k, v] of Object.entries(resolved)) {
+    const val = String((v as any)?.value ?? "").trim();
+    if (val) profile[k] = val;
+  }
+
+  const entries = (b?.entries ?? []) as any[];
+  const textEntries = entries
+    .filter((e) => typeof e.q === "string" && typeof e.a === "string")
+    .map((e) => `${e.q}: ${e.a}`)
+    .join("\n");
+
+  return {
+    profile,
+    contextText: textEntries,
+  };
+}
+
   async function askAgent(message: string, sessionId: string, sectionId: string) {
   try {
     const userHint = {
@@ -363,19 +387,31 @@ useEffect(() => {
       depthBudget: 3        // budget d’approfondissement max (un peu plus de relance)
     };
 
-    const res = await fetch("/api/agent/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...userHint, profile: currentProfileFor(sectionId) }),
-    });
-    const json = await res.json().catch(() => null);
-    if (res.ok && json && typeof json.say === "string") {
-      return { say: String(json.say).trim(), patch: json.patch || null, done: !!json.done };
-    }
-  } catch {}
-  return { say: "", patch: null, done: false };
+    const { profile, contextText } = fullContextForAgent(sectionId);
+
+
+const res = await fetch('/api/agent/chat', {
+method: 'POST',
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify({ ...userHint, profile, context: contextText }),
+});
+
+
+const json = await res.json().catch(() => null);
+if (res.ok && json && typeof json.say === 'string') {
+return {
+say: String(json.say).trim(),
+patch: json.patch || null,
+done: !!json.done,
+};
+}
+} catch {}
+
+
+return { say: '', patch: null, done: false };
 }
 
+  
 
   // ===== Agent heuristique legacy (conservé en fallback) =====
   async function fetchNextQuestionFor(blockId: string, lastAnswer?: string) {
@@ -772,12 +808,10 @@ function scheduleFinalize(text: string, ctx?: { blockId?: string; question?: str
 
   return (
     <main className="max-w-3xl mx-auto p-6 space-y-6">
-      <header className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Interview</h1>
-        <button className="text-sm text-gray-500" onClick={() => router.push("/blocks")}>
-          ← Voir les blocs
-        </button>
-      </header>
+  <header className="flex items-center justify-between">
+  <h1 className="text-2xl font-semibold">Interview</h1>
+  <PageNavButtons show={["home", "blocks", "draft"]} />
+</header>
 
       {/* Contrôles principaux */}
       <section className="space-y-2 border rounded-xl p-4 bg-white">

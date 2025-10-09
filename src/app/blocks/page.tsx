@@ -8,8 +8,7 @@ import type { Block, Entry } from "@/data/blocks";
 import { clearDraftStorage } from "@/lib/draftStorage";
 import LiveSTT from "@/app/interview/LiveSTT";
 import VoiceChatControls from "@/components/VoiceChatControls";
-
-// Chat libre par bloc: UI locale (pas de STT ici)
+import { PageNavButtons } from "@/components/ui/PageNavButtons";
 
 type BlockWithOrder = Block & { order?: number };
 
@@ -26,6 +25,7 @@ const ORDER: Record<string, number> = {
   theme_central: 80,
   heritage: 90,
 };
+
 type BlocksMap = Record<string, Block>;
 
 type ReconcileItem = {
@@ -74,9 +74,9 @@ export default function BlocksPage() {
     blockId: string,
     patch: Record<string, { value: string; source?: string }>
   ) => Promise<void> = _api.setResolved;
-  
+
   const unsetResolved: (blockId: string, key: string) => Promise<void> = _api.unsetResolved;
-const cleanupConflictsFor: (blockId: string, slotId: string) => Promise<void> =
+  const cleanupConflictsFor: (blockId: string, slotId: string) => Promise<void> =
     _api.cleanupConflictsFor;
   const importBlocks: (raw: unknown) => Promise<void> = _api.importBlocks;
   const addTextEntry: (blockId: string, q: string, a: string) => Promise<void> = _api.addTextEntry;
@@ -116,7 +116,6 @@ const cleanupConflictsFor: (blockId: string, slotId: string) => Promise<void> =
   const [chatSending, setChatSending] = useState<Record<string, boolean>>({});
   const [sttStatus, setSttStatus] = useState<Record<string, string>>({});
   const [chatMode, setChatMode] = useState<Record<string, "text" | "voice">>({});
-
 
   function yyyymmddHHMM() {
     const d = new Date();
@@ -173,67 +172,67 @@ const cleanupConflictsFor: (blockId: string, slotId: string) => Promise<void> =
   }, []);
 
   const items = useMemo(
-  () => (blocks ? (Object.values(blocks) as BlockWithOrder[]) : []),
-  [blocks]
-);
+    () => (blocks ? (Object.values(blocks) as BlockWithOrder[]) : []),
+    [blocks]
+  );
 
-const sorted = useMemo(() => {
-  return items.slice().sort((a, b) => {
-    const oa = (a.order ?? ORDER[a.id] ?? 0);
-    const ob = (b.order ?? ORDER[b.id] ?? 0);
-    if (oa !== ob) return oa - ob;
-    return (a.progress ?? 0) - (b.progress ?? 0);
-  });
-}, [items]);
+  const sorted = useMemo(() => {
+    return items.slice().sort((a, b) => {
+      const oa = a.order ?? ORDER[a.id] ?? 0;
+      const ob = b.order ?? ORDER[b.id] ?? 0;
+      if (oa !== ob) return oa - ob;
+      return (a.progress ?? 0) - (b.progress ?? 0);
+    });
+  }, [items]);
 
   async function verifyWithAgent(blockId: string) {
-  try {
-    const b = blocks?.[blockId] as (BlockWithOrder & any) | undefined;
-    const lastAnswer =
-      (b?.entries?.length ? (b!.entries[b!.entries.length - 1] as any).a : "") || "";
+    try {
+      const b = blocks?.[blockId] as (BlockWithOrder & any) | undefined;
+      const lastAnswer =
+        (b?.entries?.length ? (b!.entries[b!.entries.length - 1] as any).a : "") || "";
 
-    // aplatit le profil canonique { field: {value,source} } -> { field: value }
-    const canonical = Object.fromEntries(
-      Object.entries(b?.resolved ?? {}).map(([k, v]: any) => [k, (v?.value ?? "").toString()])
-    );
+      // aplatit le profil canonique { field: {value,source} } -> { field: value }
+      const canonical = Object.fromEntries(
+        Object.entries(b?.resolved ?? {}).map(([k, v]: any) => [k, (v?.value ?? "").toString()])
+      );
 
-    const locks = (b?.locks ?? {});
+      const locks = b?.locks ?? {};
 
-    const res = await fetch("/api/llm/validate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        blockId,
-        section: blockId,
-        canonical,
-        locks,
-        lastAnswer,
-      }),
-    });
+      const res = await fetch("/api/llm/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          blockId,
+          section: blockId,
+          canonical,
+          locks,
+          lastAnswer,
+        }),
+      });
 
-    const json = await res.json().catch(() => ({}));
-    if (!res.ok || !json) {
-      setAgentNote((m) => ({ ...m, [blockId]: "Agent indisponible (validate)." }));
-      return;
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json) {
+        setAgentNote((m) => ({ ...m, [blockId]: "Agent indisponible (validate)." }));
+        return;
+      }
+
+      const follow =
+        typeof json.followup === "string" && json.followup.trim()
+          ? json.followup.trim()
+          : "(pas de follow-up proposé)";
+      const missing =
+        Array.isArray(json.missing) && json.missing.length
+          ? `Champs manquants: ${json.missing.join(", ")}`
+          : "Aucun champ manquant détecté";
+
+      setAgentNote((m) => ({
+        ...m,
+        [blockId]: `${follow}\n${missing}`,
+      }));
+    } catch (e: any) {
+      setAgentNote((m) => ({ ...m, [blockId]: `Erreur: ${e?.message || "réseau"}` }));
     }
-
-    const follow =
-      typeof json.followup === "string" && json.followup.trim()
-        ? json.followup.trim()
-        : "(pas de follow-up proposé)";
-    const missing =
-      Array.isArray(json.missing) && json.missing.length
-        ? `Champs manquants: ${json.missing.join(", ")}`
-        : "Aucun champ manquant détecté";
-
-    setAgentNote((m) => ({
-      ...m,
-      [blockId]: `${follow}\n${missing}`,
-    }));
-  } catch (e: any) {
-    setAgentNote((m) => ({ ...m, [blockId]: `Erreur: ${e?.message || "réseau"}` }));
   }
-}
 
   // Chat libre: profil aplati pour l'agent et envoi d'un tour
   function currentProfileFor(blockId: string): Record<string, string> {
@@ -250,14 +249,21 @@ const sorted = useMemo(() => {
   async function sendChat(blockId: string) {
     const text = (chatDrafts[blockId] ?? "").trim();
     if (!text) return;
-    setChat((m) => ({ ...m, [blockId]: [ ...(m[blockId] || []), { role: "user", text, ts: Date.now() } ] }));
+    setChat((m) => ({
+      ...m,
+      [blockId]: [...(m[blockId] || []), { role: "user", text, ts: Date.now() }],
+    }));
     setChatSending((m) => ({ ...m, [blockId]: true }));
     setChatDrafts((m) => ({ ...m, [blockId]: "" }));
-    try { await addTextEntry(blockId, "Chat", text); } catch {}
+    try {
+      await addTextEntry(blockId, "Chat", text);
+    } catch {}
     try {
       // Isoler la session par bloc pour éviter les fuites de contexte
       const chatSessionId = `${sessionId || "ms"}::${blockId}`;
-      const res = await fetch("/api/agent/chat", {
+      console.log("🧠 Chat libre →", { sessionId: chatSessionId, mode: "free", text });
+      const res = await fetch("/api/agent/chat", {       
+
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -278,23 +284,47 @@ const sorted = useMemo(() => {
         say = `Tu mentionnes « ${teaser} ». Peux-tu développer librement, avec un exemple concret, un moment précis, et ce que tu as ressenti ?`;
       }
       if (say) {
-        setChat((m) => ({ ...m, [blockId]: [ ...(m[blockId] || []), { role: "assistant", text: say, ts: Date.now() } ] }));
+        setChat((m) => ({
+          ...m,
+          [blockId]: [...(m[blockId] || []), { role: "assistant", text: say, ts: Date.now() }],
+        }));
       }
-      const patchRaw = json?.patch && typeof json.patch === "object" ? (json.patch as Record<string, any>) : null;
+      const patchRaw =
+        json?.patch && typeof json.patch === "object" ? (json.patch as Record<string, any>) : null;
       if (patchRaw) {
         const payload: Record<string, { value: string; source?: string }> = {};
         for (const [k, v] of Object.entries(patchRaw)) {
           let val = "";
-          if (typeof v === "string") val = v; else if (typeof v === "number" || typeof v === "boolean") val = String(v);
-          else if (Array.isArray(v)) val = v.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
-          else if (v && typeof v === "object") { if (typeof (v as any).value === "string") val = (v as any).value; else if (typeof (v as any).text === "string") val = (v as any).text; else if (typeof (v as any).label === "string") val = (v as any).label; else { try { val = JSON.stringify(v); } catch { val = String(v); } } }
-          else { val = String(v ?? ""); }
+          if (typeof v === "string") val = v;
+          else if (typeof v === "number" || typeof v === "boolean") val = String(v);
+          else if (Array.isArray(v))
+            val = v
+              .map((x) => (typeof x === "string" ? x : JSON.stringify(x)))
+              .join(" ");
+          else if (v && typeof v === "object") {
+            if (typeof (v as any).value === "string") val = (v as any).value;
+            else if (typeof (v as any).text === "string") val = (v as any).text;
+            else if (typeof (v as any).label === "string") val = (v as any).label;
+            else {
+              try {
+                val = JSON.stringify(v);
+              } catch {
+                val = String(v);
+              }
+            }
+          } else {
+            val = String(v ?? "");
+          }
           payload[String(k)] = { value: val, source: "agent_chat" };
         }
         if (Object.keys(payload).length) {
           try {
             await setResolved(blockId, payload);
-            for (const key of Object.keys(payload)) { try { await cleanupConflictsFor(blockId, key); } catch {} }
+            for (const key of Object.keys(payload)) {
+              try {
+                await cleanupConflictsFor(blockId, key);
+              } catch {}
+            }
           } catch {}
         }
       }
@@ -303,7 +333,6 @@ const sorted = useMemo(() => {
       setChatSending((m) => ({ ...m, [blockId]: false }));
     }
   }
-
 
   async function handleResetAll() {
     const ok = confirm(
@@ -384,54 +413,50 @@ const sorted = useMemo(() => {
   }
 
   async function proposeCorrections(blockId: string) {
-  const b = blocks?.[blockId];
-  if (!b) return;
+    const b = blocks?.[blockId];
+    if (!b) return;
 
-  const summaryText = (draftSummaries[blockId] ?? "").trim();
-  if (!summaryText) {
-    alert("Le résumé est vide.");
-    return;
-  }
-
-  // ⚠️ Aplatir le profil canonique -> { field: "value" }
-  const currentResolved = (b as any).resolved || {};
-  const currentFlat: Record<string, string> = Object.fromEntries(
-    Object.entries(currentResolved).map(([k, v]: any) => [
-      k,
-      (v && typeof v === "object" && "value" in v && v.value != null) ? String(v.value) : String(v ?? ""),
-    ])
-  );
-
-  setRecon(blockId, { loading: true });
-  try {
-    const res = await fetch("/api/llm/reconcile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        blockId,
-        summaryText,
-        current: currentFlat, // 🔧 envoyer la version plate
-        // lang: "fr", // <-- si ton endpoint est sensible à la langue, décommente
-      }),
-    });
-
-    const json = await res.json().catch(() => ({}));
-    const items = Array.isArray(json?.proposals) ? (json.proposals as ReconcileItem[]) : [];
-
-    setRecon(blockId, { loading: false, items });
-    if (!items.length) {
-      // Petit feedback utile pour debug côté serveur
-      const reason = typeof json?.reason === "string" && json.reason
-        ? `\nRaison: ${json.reason}`
-        : "";
-      alert("Aucune correction détectée." + reason);
+    const summaryText = (draftSummaries[blockId] ?? "").trim();
+    if (!summaryText) {
+      alert("Le résumé est vide.");
+      return;
     }
-  } catch (e) {
-    setRecon(blockId, { loading: false, items: [] });
-    alert("Échec des propositions de correction.");
-  }
-}
 
+    // ⚠️ Aplatir le profil canonique -> { field: "value" }
+    const currentResolved = (b as any).resolved || {};
+    const currentFlat: Record<string, string> = Object.fromEntries(
+      Object.entries(currentResolved).map(([k, v]: any) => [
+        k,
+        (v && typeof v === "object" && "value" in v && v.value != null) ? String(v.value) : String(v ?? ""),
+      ])
+    );
+
+    setRecon(blockId, { loading: true });
+    try {
+      const res = await fetch("/api/llm/reconcile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          blockId,
+          summaryText,
+          current: currentFlat,
+        }),
+      });
+
+      const json = await res.json().catch(() => ({}));
+      const items = Array.isArray(json?.proposals) ? (json.proposals as ReconcileItem[]) : [];
+
+      setRecon(blockId, { loading: false, items });
+      if (!items.length) {
+        const reason =
+          typeof json?.reason === "string" && json.reason ? `\nRaison: ${json.reason}` : "";
+        alert("Aucune correction détectée." + reason);
+      }
+    } catch (e) {
+      setRecon(blockId, { loading: false, items: [] });
+      alert("Échec des propositions de correction.");
+    }
+  }
 
   async function applyCorrections(blockId: string) {
     const data = reconcile[blockId];
@@ -469,26 +494,64 @@ const sorted = useMemo(() => {
   if (loading) return <div className="p-6">Chargement…</div>;
   if (!blocks) {
     return (
-      <main className="max-w-4xl mx-auto p-6">
+      <main className="max-w-5xl mx-auto p-6 space-y-6">
+        {/* ✅ Boutons de navigation en haut */}
+        <PageNavButtons show={["home", "interview", "draft"]} />
+
         <header className="flex items-center justify-between mb-4">
           <h1 className="text-2xl font-semibold">Blocs</h1>
-          <div className="flex items-center gap-2">
-            <Link href="/interview" className="text-sm text-blue-600 hover:underline">
-              → Ouvrir l’interview
-            </Link>
-            <button
-              className="text-sm px-3 py-1.5 border rounded hover:bg-red-50"
-              onClick={handleResetAll}
-              title="Réinitialise les blocs ET la mémoire de l’agent"
-            >
-              Réinitialiser (données + agent)
-            </button>
-          </div>
         </header>
-        <div className="text-xs text-gray-500 mb-3">
-          Session agent : <code className="px-1 py-0.5 bg-gray-100 rounded">{sessionId || "…"}</code>
+
+        {/* ✅ Section Import/Export + Reset */}
+        <section className="border rounded-xl bg-white p-4 flex flex-wrap items-center gap-3">
+          <div className="text-xs text-gray-500 mr-auto">
+            Session agent :{" "}
+            <code className="px-1 py-0.5 bg-gray-100 rounded">{sessionId || "…"}</code>
+          </div>
+
+          <button
+            className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+            onClick={handleExportAll}
+            title="Télécharge un JSON contenant tous les blocs"
+          >
+            Exporter tout (JSON)
+          </button>
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) {
+                handleImportAllFromFile(f).finally(() => {
+                  if (fileInputRef.current) fileInputRef.current.value = "";
+                });
+              }
+            }}
+          />
+          <button
+            className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+            onClick={triggerImport}
+            title="Remplace les données locales par un JSON exporté"
+          >
+            Importer JSON…
+          </button>
+
+          {/* 🧨 Réinitialiser déplacé ici */}
+          <button
+            className="px-3 py-1.5 border border-red-300 text-red-600 rounded text-sm hover:bg-red-50 hover:text-red-700 transition-colors"
+            onClick={handleResetAll}
+            title="Réinitialise les blocs ET la mémoire de l’agent"
+          >
+            Réinitialiser
+          </button>
+        </section>
+
+        <div className="p-6 border rounded-xl bg-white text-sm text-gray-500">
+          Aucun bloc trouvé.
         </div>
-        <div className="p-6 border rounded-xl bg-white">Aucun bloc.</div>
       </main>
     );
   }
@@ -497,32 +560,14 @@ const sorted = useMemo(() => {
 
   return (
     <main className="max-w-5xl mx-auto p-6 space-y-6">
-      <header className="flex items-center justify-between">
-  <h1 className="text-2xl font-semibold">Blocs</h1>
-  <div className="flex items-center gap-2">
-    <Link
-      href={`/interview?sessionId=${encodeURIComponent(sessionId)}`}
-      className="text-sm text-blue-600 hover:underline"
-    >
-      → Ouvrir l’interview
-    </Link>
-    <Link
-      href="/draft"
-      className="text-sm text-blue-600 hover:underline"
-    >
-      → Voir le Draft
-    </Link>
-    <button
-      className="text-sm px-3 py-1.5 border rounded hover:bg-red-50"
-      onClick={handleResetAll}
-      title="Réinitialise les blocs ET la mémoire de l’agent"
-    >
-      Réinitialiser (données + agent)
-    </button>
-  </div>
-</header>
+      {/* ✅ Boutons de navigation en haut */}
+      <PageNavButtons show={["home", "interview", "draft"]} />
 
-      {/* BARRE EXPORT / IMPORT GLOBALE */}
+      <header className="flex items-center justify-between">
+        <h1 className="text-2xl font-semibold">Blocs</h1>
+      </header>
+
+      {/* ✅ BARRE EXPORT / IMPORT GLOBALE + Reset */}
       <section className="border rounded-xl bg-white p-4 flex flex-wrap items-center gap-3">
         <div className="text-xs text-gray-500 mr-auto">
           Session agent :{" "}
@@ -558,9 +603,19 @@ const sorted = useMemo(() => {
         >
           Importer JSON…
         </button>
+
+        {/* 🧨 Réinitialiser ici (plus dans le header) */}
+        <button
+          className="px-3 py-1.5 border border-red-300 text-red-600 rounded text-sm hover:bg-red-50 hover:text-red-700 transition-colors"
+          onClick={handleResetAll}
+          title="Réinitialise les blocs ET la mémoire de l’agent"
+        >
+          Réinitialiser
+        </button>
       </section>
 
-  <section>
+      {/* ===== Liste des blocs ===== */}
+      <section>
         <div className="grid grid-cols-12 gap-0 px-4 py-3 text-xs font-medium text-gray-500 bg-gray-50">
           <div className="col-span-3">Bloc</div>
           <div className="col-span-2">Progression</div>
@@ -571,28 +626,24 @@ const sorted = useMemo(() => {
         <ul className="space-y-6">
           {sortedList.map((b) => (
             <li key={b.id} className="p-4 border-2 rounded-lg bg-white shadow-sm">
-
               <div className="grid grid-cols-12 items-start gap-4">
-  {/* Titre du bloc */}
-  <div className="col-span-3 flex flex-col justify-start">
-    <h2 className="text-xl font-bold text-gray-800 leading-tight">{b.title}</h2>
-    <div className="h-[3px] w-2/3 bg-gradient-to-r from-orange-400 via-pink-500 to-purple-500 rounded-full shadow-sm"></div>
-
-
-  </div>
+                {/* Titre du bloc */}
+                <div className="col-span-3 flex flex-col justify-start">
+                  <h2 className="text-xl font-bold text-gray-800 leading-tight">{b.title}</h2>
+                  <div className="h-[3px] w-2/3 bg-gradient-to-r from-[#6BA5C8] to-[#9DC8A5] rounded-full shadow-sm"></div>
+                </div>
 
                 {/* Barre de progression */}
-  <div className="col-span-2">
-  <div className="relative w-full bg-gray-100 rounded h-2 overflow-hidden">
-    <div
-      className="bg-indigo-500 h-2 transition-all duration-300"
-      style={{ width: `${Math.max(0, Math.min(100, b.progress ?? 0))}%` }}
-    />
-  </div>
-  <div className="text-xs text-gray-600 mt-1 pl-2">{b.progress ?? 0}%</div>
-</div>
-  
-  
+                <div className="col-span-2">
+                  <div className="relative w-full bg-gray-100 rounded h-2 overflow-hidden">
+                    <div
+                      className="bg-indigo-500 h-2 transition-all duration-300"
+                      style={{ width: `${Math.max(0, Math.min(100, b.progress ?? 0))}%` }}
+                    />
+                  </div>
+                  <div className="text-xs text-gray-600 mt-1 pl-2">{b.progress ?? 0}%</div>
+                </div>
+
                 <div className="col-span-1 text-xs text-gray-700 pt-1">
                   {b.entries?.length ?? 0}
                 </div>
@@ -606,13 +657,14 @@ const sorted = useMemo(() => {
                   >
                     Ouvrir l’interview
                   </Link>
+
                   <Link
-  href={`/blocks/${encodeURIComponent(b.id)}`}
-  className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
-  title="Éditer le bloc"
->
-  Éditer
-</Link>
+                    href={`/blocks/${encodeURIComponent(b.id)}`}
+                    className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                    title="Éditer le bloc"
+                  >
+                    Éditer
+                  </Link>
 
                   <button
                     onClick={() => verifyWithAgent(b.id)}
@@ -630,20 +682,27 @@ const sorted = useMemo(() => {
                   {/* Chat libre */}
                   <div className="flex items-center justify-between mb-1">
                     <div className="text-sm font-medium">Chat libre</div>
-                  <div className="text-xs text-gray-500">
-                      {chatSending[b.id] ? "Envoi..." : (sttStatus[b.id] || "")}
+                    <div className="text-xs text-gray-500">
+                      {chatSending[b.id] ? "Envoi..." : sttStatus[b.id] || ""}
                     </div>
                   </div>
 
                   {(openChat[b.id] ?? true) && (
                     <div className="space-y-2 mb-2">
                       <div className="max-h-48 overflow-auto border rounded p-2 bg-white/50">
-                        {(chat[b.id]?.length ? (
+                        {chat[b.id]?.length ? (
                           (chat[b.id] || []).map((m, idx) => (
-                            <div key={idx} className={`flex ${m.role === "assistant" ? "justify-start" : "justify-end"} mb-1`}>
+                            <div
+                              key={idx}
+                              className={`flex ${
+                                m.role === "assistant" ? "justify-start" : "justify-end"
+                              } mb-1`}
+                            >
                               <div
                                 className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm shadow ${
-                                  m.role === "assistant" ? "bg-indigo-50 text-indigo-900" : "bg-gray-100 text-gray-900"
+                                  m.role === "assistant"
+                                    ? "bg-indigo-50 text-indigo-900"
+                                    : "bg-gray-100 text-gray-900"
                                 }`}
                               >
                                 {m.text}
@@ -651,67 +710,66 @@ const sorted = useMemo(() => {
                             </div>
                           ))
                         ) : (
-                          <div className="text-xs text-gray-500">Lance un sujet pour ce bloc.</div>
-                        ))}
+                          <div className="text-xs text-gray-500">
+                            Lance un sujet pour ce bloc.
+                          </div>
+                        )}
                       </div>
 
                       <div className="space-y-2 w-full">
-  <div className="flex items-center justify-start gap-2 mb-1">
-    <span className="text-xs text-gray-600 font-medium">Mode :</span>
-    <button
-      onClick={() => setChatMode((m) => ({ ...m, [b.id]: "text" }))}
-      className={`text-xs px-2 py-1 border rounded ${
-        (chatMode[b.id] ?? "text") === "text" ? "bg-gray-100" : ""
-      }`}
-    >
-      Texte
-    </button>
-    <button
-      onClick={() => setChatMode((m) => ({ ...m, [b.id]: "voice" }))}
-      className={`text-xs px-2 py-1 border rounded ${
-        chatMode[b.id] === "voice" ? "bg-gray-100" : ""
-      }`}
-    >
-      Voix
-    </button>
-  </div>
+                        <div className="flex items-center justify-start gap-2 mb-1">
+                          <span className="text-xs text-gray-600 font-medium">Mode :</span>
+                          <button
+                            onClick={() => setChatMode((m) => ({ ...m, [b.id]: "text" }))}
+                            className={`text-xs px-2 py-1 border rounded ${
+                              (chatMode[b.id] ?? "text") === "text" ? "bg-gray-100" : ""
+                            }`}
+                          >
+                            Texte
+                          </button>
+                          <button
+                            onClick={() => setChatMode((m) => ({ ...m, [b.id]: "voice" }))}
+                            className={`text-xs px-2 py-1 border rounded ${
+                              chatMode[b.id] === "voice" ? "bg-gray-100" : ""
+                            }`}
+                          >
+                            Voix
+                          </button>
+                        </div>
 
-  {(chatMode[b.id] ?? "text") === "text" ? (
-    <div className="flex items-center flex-wrap gap-2">
-      <input
-        className="flex-1 border rounded p-2 text-sm"
-        placeholder="Lancer un sujet ou répondre..."
-        value={chatDrafts[b.id] ?? ""}
-        onChange={(e) =>
-          setChatDrafts((m) => ({ ...m, [b.id]: e.target.value }))
-        }
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            sendChat(b.id);
-          }
-        }}
-      />
-      <button
-        className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
-        onClick={() => sendChat(b.id)}
-        disabled={!chatDrafts[b.id]?.trim() || !!chatSending[b.id]}
-        title="Envoyer au chat"
-      >
-        Envoyer
-      </button>
-    </div>
-  ) : (
-    <VoiceChatControls
-      value={chatDrafts[b.id] ?? ""}
-      onChange={(t) =>
-        setChatDrafts((m) => ({ ...m, [b.id]: t }))
-      }
-      onValidate={() => sendChat(b.id)}
-    />
-  )}
-</div>
-
+                        {(chatMode[b.id] ?? "text") === "text" ? (
+                          <div className="flex items-center flex-wrap gap-2">
+                            <input
+                              className="flex-1 border rounded p-2 text-sm"
+                              placeholder="Lancer un sujet ou répondre..."
+                              value={chatDrafts[b.id] ?? ""}
+                              onChange={(e) =>
+                                setChatDrafts((m) => ({ ...m, [b.id]: e.target.value }))
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" && !e.shiftKey) {
+                                  e.preventDefault();
+                                  sendChat(b.id);
+                                }
+                              }}
+                            />
+                            <button
+                              className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50"
+                              onClick={() => sendChat(b.id)}
+                              disabled={!chatDrafts[b.id]?.trim() || !!chatSending[b.id]}
+                              title="Envoyer au chat"
+                            >
+                              Envoyer
+                            </button>
+                          </div>
+                        ) : (
+                          <VoiceChatControls
+                            value={chatDrafts[b.id] ?? ""}
+                            onChange={(t) => setChatDrafts((m) => ({ ...m, [b.id]: t }))}
+                            onValidate={() => sendChat(b.id)}
+                          />
+                        )}
+                      </div>
                     </div>
                   )}
 
@@ -795,7 +853,9 @@ const sorted = useMemo(() => {
                       <ul className="list-disc pl-5 space-y-1">
                         {reconcile[b.id].items.map((it, idx) => (
                           <li key={idx}>
-                            <code>{it.field}</code>: <s>{it.old ?? "-"}</s>{' -> '}<b>{it.new}</b>
+                            <code>{it.field}</code>: <s>{it.old ?? "-"}</s>
+                            {" -> "}
+                            <b>{it.new}</b>
                             {typeof it.confidence === "number" && (
                               <span className="ml-2 text-xs opacity-80">
                                 ({Math.round(it.confidence * 100)}%)
@@ -822,44 +882,50 @@ const sorted = useMemo(() => {
                         </div>
                       ) : (
                         <ul className="space-y-2">
-  {Object.entries(b.resolved || {}).map(([k, v]) => (
-    <li key={k} className="flex flex-col sm:flex-row sm:items-center gap-2 text-sm">
-      <label className="text-xs w-48 font-medium text-gray-600">{k}</label>
-      <input
-        defaultValue={v?.value ?? ""}
-        className="flex-1 border rounded p-2 text-sm"
-        onBlur={async (e) => {
-          const newVal = e.target.value.trim();
-          if (newVal && newVal !== v?.value) {
-            try {
-              await setResolved(b.id, { [k]: { value: newVal, source: "user_edit" } });
-            } catch (err) {
-              console.error("Erreur update resolved:", err);
-            }
-          }
-        }}
-      />
-      <div className="flex items-center gap-2">
-        <div className="text-xs text-gray-400">
-          {v?.source ?? "-"} {v?.at ? `- ${new Date(v.at).toLocaleString()}` : ""}
-        </div>
-        <button
-          className="px-2 py-1 border rounded text-xs hover:bg-red-50 hover:text-red-700"
-          title="Supprimer cette valeur canonique"
-          onClick={async () => {
-            try {
-              await unsetResolved(b.id, k);
-            } catch (err) {
-              console.error("unsetResolved error:", err);
-            }
-          }}
-        >
-          Supprimer
-        </button>
-      </div>
-    </li>
-  ))}
-</ul>
+                          {Object.entries(b.resolved || {}).map(([k, v]) => (
+                            <li
+                              key={k}
+                              className="flex flex-col sm:flex-row sm:items-center gap-2 text-sm"
+                            >
+                              <label className="text-xs w-48 font-medium text-gray-600">{k}</label>
+                              <input
+                                defaultValue={v?.value ?? ""}
+                                className="flex-1 border rounded p-2 text-sm"
+                                onBlur={async (e) => {
+                                  const newVal = e.target.value.trim();
+                                  if (newVal && newVal !== v?.value) {
+                                    try {
+                                      await setResolved(b.id, {
+                                        [k]: { value: newVal, source: "user_edit" },
+                                      });
+                                    } catch (err) {
+                                      console.error("Erreur update resolved:", err);
+                                    }
+                                  }
+                                }}
+                              />
+                              <div className="flex items-center gap-2">
+                                <div className="text-xs text-gray-400">
+                                  {v?.source ?? "-"}{" "}
+                                  {v?.at ? `- ${new Date(v.at).toLocaleString()}` : ""}
+                                </div>
+                                <button
+                                  className="px-2 py-1 border rounded text-xs hover:bg-red-50 hover:text-red-700"
+                                  title="Supprimer cette valeur canonique"
+                                  onClick={async () => {
+                                    try {
+                                      await unsetResolved(b.id, k);
+                                    } catch (err) {
+                                      console.error("unsetResolved error:", err);
+                                    }
+                                  }}
+                                >
+                                  Supprimer
+                                </button>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
                       )}
                     </div>
                   )}
@@ -872,14 +938,3 @@ const sorted = useMemo(() => {
     </main>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
