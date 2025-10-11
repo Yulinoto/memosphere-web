@@ -11,6 +11,11 @@ import { SortableBlockList } from "@/components/DraftBuilder/SortableBlockList";
 import { Plus, Trash2, MessageCircle, Blocks } from "lucide-react";
 import { useBlocks } from "@/hooks/useBlocks";
 import { PageNavButtons } from "@/components/ui/PageNavButtons";
+import ReactMarkdown from "react-markdown";
+import jsPDF from "jspdf";
+import html2canvas from "html2canvas";
+
+
 
 interface Block {
   id: string;
@@ -36,11 +41,18 @@ export default function BuilderPage() {
   const [bookTitle, setBookTitle] = useState("");
   const [subtitle, setSubtitle] = useState("");
   const [style, setStyle] = useState("narratif");
+  const [pointOfView, setPointOfView] = useState("first");
   const [styleInstructions, setStyleInstructions] = useState("");
   const [introHint, setIntroHint] = useState("");
   const [conclusionHint, setConclusionHint] = useState("");
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
+  // 📄 État de l’aperçu
+  const [previewText, setPreviewText] = useState("");
+const [previewLoading, setPreviewLoading] = useState(false);
+  // 📘 État de la génération du livre
+const [bookText, setBookText] = useState("");
+const [generatingBook, setGeneratingBook] = useState(false);
 
   // Hydratation depuis localStorage
   useEffect(() => {
@@ -177,6 +189,177 @@ export default function BuilderPage() {
       setLoadingId(null);
     }
   }
+  async function handlePreviewBook() {
+  setPreviewLoading(true);
+  try {
+    const res = await fetch("/api/book/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        style,
+        pointOfView,
+        blocks: sortedBlocks,
+      }),
+    });
+    const json = await res.json();
+    setPreviewText(json.text || "⚠️ Aucun aperçu généré.");
+  } catch (e) {
+    console.error(e);
+    setPreviewText("❌ Erreur lors de la génération de l’aperçu.");
+  } finally {
+    setPreviewLoading(false);
+  }
+}
+
+async function handleGenerateBook() {
+  setGeneratingBook(true);
+  setBookText("");
+  try {
+    const res = await fetch("/api/book/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        blocks,
+        pointOfView,
+        style: style || "narratif",
+      }),
+    });
+    const json = await res.json();
+    if (json.ok && json.text) {
+      setBookText(json.text);
+    } else {
+      setBookText("⚠️ Erreur lors de la génération du livre.");
+    }
+  } catch (e) {
+    console.error("Erreur génération livre:", e);
+    setBookText("❌ Erreur réseau ou serveur.");
+  } finally {
+    setGeneratingBook(false);
+  }
+}
+
+async function handleExportPDF() {
+  try {
+    const pdf = new jsPDF({
+      orientation: "portrait",
+      unit: "pt",
+      format: "a4",
+    });
+
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const margin = 60;
+
+    // === TITRES DYNAMIQUES ===
+    const mainTitle = bookTitle || "Titre du livre";
+    const subTitle = subtitle || "Sous-titre ou thème principal";
+
+    // === PAGE DE COUVERTURE ===
+    pdf.setFillColor(107, 165, 200);
+    pdf.rect(0, 0, pageWidth, pageHeight, "F");
+
+    pdf.setTextColor(255, 255, 255);
+    pdf.setFont("helvetica", "bold");
+    pdf.setFontSize(36);
+    pdf.text(mainTitle, pageWidth / 2, pageHeight / 2 - 20, { align: "center" });
+
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(18);
+    pdf.text(subTitle, pageWidth / 2, pageHeight / 2 + 20, { align: "center" });
+
+    pdf.setFontSize(12);
+    pdf.text("MemoSphere Book", pageWidth / 2, pageHeight - 50, { align: "center" });
+
+    // === PAGE 2 : SOMMAIRE ===
+    pdf.addPage();
+    pdf.setFont("helvetica", "bold");
+    pdf.setFontSize(22);
+    pdf.setTextColor(33, 33, 33);
+    pdf.text("Sommaire", margin, margin);
+
+    const chapterTitles = (bookText.match(/^#+\s+.+/gm) || []).map((l) =>
+      l.replace(/^#+\s*/, "").trim()
+    );
+
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(12);
+    let tocY = margin + 40;
+    chapterTitles.forEach((title, i) => {
+      pdf.text(`${i + 1}. ${title}`, margin, tocY);
+      tocY += 20;
+      if (tocY > pageHeight - 80) {
+        pdf.addPage();
+        tocY = margin;
+      }
+    });
+
+    // === TRAITEMENT DES CHAPITRES ===
+    const chapters = bookText.split(/^#\s+/gm).filter(Boolean);
+
+    for (let i = 0; i < chapters.length; i++) {
+      const chapter = chapters[i].trim();
+      const titleLine = chapter.split("\n")[0].trim();
+      const contentText = chapter.split("\n").slice(1).join("\n").trim();
+
+      // === PAGE D’OUVERTURE DU CHAPITRE ===
+      pdf.addPage();
+      pdf.setFillColor(240, 240, 240);
+      pdf.rect(0, 0, pageWidth, pageHeight, "F");
+
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(30);
+      pdf.setTextColor(50, 50, 50);
+      pdf.text(`Chapitre ${i + 1}`, pageWidth / 2, pageHeight / 2 - 30, { align: "center" });
+
+      pdf.setFont("helvetica", "normal");
+      pdf.setFontSize(18);
+      pdf.text(titleLine, pageWidth / 2, pageHeight / 2 + 15, { align: "center" });
+
+      // === PAGE SUIVANTE : CONTENU DU CHAPITRE ===
+      pdf.addPage();
+      pdf.setFont("times", "normal");
+      pdf.setFontSize(12);
+      pdf.setTextColor(30, 30, 30);
+
+      const lines = pdf.splitTextToSize(contentText, pageWidth - margin * 2);
+      let y = margin;
+
+      for (const line of lines) {
+        if (y > pageHeight - margin) {
+          pdf.addPage();
+          pdf.setFont("times", "normal");
+          pdf.setFontSize(12);
+          y = margin;
+        }
+        pdf.text(line, margin, y);
+        y += 18;
+      }
+    }
+
+    // === PIEDS DE PAGE : uniquement à partir des chapitres ===
+    const pageCount = (pdf.internal as any).getNumberOfPages();
+    for (let i = 1; i <= pageCount; i++) {
+      if (i <= 2) continue; // pas de pied sur couverture + sommaire
+      pdf.setPage(i);
+      pdf.setFontSize(10);
+      pdf.setTextColor(150);
+      pdf.text(`Page ${i - 2} / ${pageCount - 2}`, pageWidth - margin, pageHeight - 25, {
+        align: "right",
+      });
+      pdf.text("MemoSphere - Souvenirs de vie", margin, pageHeight - 25);
+    }
+
+    // === ENREGISTREMENT ===
+    pdf.save(`${mainTitle.replace(/\s+/g, "_")}_MemoSphere_Book.pdf`);
+  } catch (e) {
+    console.error(e);
+    alert("Erreur lors de la génération du PDF enrichi.");
+  }
+}
+
+
+
+
 
   if (loading) return <div className="p-6">Chargement des blocs…</div>;
 
@@ -191,6 +374,7 @@ export default function BuilderPage() {
     {saveStatus === "saving" && <span className="text-amber-600">💾 Enregistrement…</span>}
     {saveStatus === "saved" && <span className="text-green-600">✅ Enregistré</span>}
   </div>
+  
 </div>
 
 
@@ -255,6 +439,22 @@ export default function BuilderPage() {
     Ce choix orientera le ton que l’agent utilisera pour la rédaction du livre.
   </p>
 </div>
+{/* Point de vue du récit */}
+<div>
+  <label className="text-sm font-medium mb-1 block">Point de vue du récit</label>
+  <select
+    value={pointOfView}
+    onChange={(e) => setPointOfView(e.target.value)}
+    className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm
+               focus:outline-none focus:ring-2 focus:ring-[#6BA5C8]/40 transition"
+  >
+    <option value="first">Première personne ("je")</option>
+    <option value="third">Troisième personne ("il/elle")</option>
+  </select>
+  <p className="text-xs text-gray-500 mt-1">
+    Ce choix déterminera la voix narrative du livre (récit intime ou narratif externe).
+  </p>
+</div>
 
 
         <div>
@@ -284,6 +484,113 @@ export default function BuilderPage() {
           />
         </div>
       </Card>
+{/* 👀 Aperçu du rendu (gratuit) */}
+<Card className="p-6 space-y-5">
+  <h2 className="text-lg font-semibold flex items-center gap-2">
+    <span role="img" aria-label="book">👀</span> Aperçu du livre (extrait gratuit)
+  </h2>
+
+  <Button
+    onClick={handlePreviewBook}
+    disabled={previewLoading}
+    className="bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold px-4 py-2 rounded-lg hover:opacity-90 transition-all"
+  >
+    {previewLoading ? "✍️ Génération de l’aperçu…" : "🔍 Voir un aperçu représentatif"}
+  </Button>
+
+  {previewText && (
+    <div className="mt-6 space-y-6">
+     {/* 📘 COUVERTURE SIMULÉE — format A5 premium */}
+<div className="relative mx-auto w-full flex flex-col items-center py-10">
+  {/* Fond de présentation façon table */}
+  <div className="relative p-10 bg-gradient-to-br from-gray-50 to-gray-100 rounded-2xl shadow-inner border border-gray-200">
+    <div className="absolute inset-0 pointer-events-none bg-gradient-to-b from-transparent via-white/40 to-white/80 opacity-50 rounded-2xl"></div>
+
+    {/* Perspective */}
+    <div className="relative flex justify-center perspective-[1000px]">
+      {/* Livre */}
+      <div
+        className="relative w-64 h-96 bg-gradient-to-br from-[#6BA5C8] to-[#9DC8A5]
+                   text-white rounded-lg shadow-2xl overflow-hidden
+                   transform rotate-y-[8deg] rotate-x-[1deg]
+                   transition-transform duration-700 ease-out
+                   hover:rotate-y-[5deg] hover:rotate-x-[0deg] hover:scale-[1.03]"
+      >
+        {/* Tranche du livre */}
+        <div className="absolute left-0 top-0 h-full w-[6px] bg-gradient-to-b from-white/30 to-white/10 opacity-40 rounded-l-md"></div>
+
+        {/* Contenu centré */}
+        <div className="absolute inset-0 flex flex-col items-center justify-center px-6 text-center select-none">
+          <h3 className="text-3xl font-bold leading-snug mb-3 drop-shadow-lg tracking-wide">
+            {bookTitle || "Titre du livre"}
+          </h3>
+          <p className="text-lg italic opacity-90 mb-6 drop-shadow-sm">
+            {subtitle || "Sous-titre du livre"}
+          </p>
+          <div className="absolute bottom-6 text-xs opacity-80 font-light tracking-wide">
+            MEMOSPHERE BOOK
+          </div>
+        </div>
+
+        {/* Reflet lumineux */}
+        <div className="absolute inset-0 bg-gradient-to-r from-white/10 via-transparent to-white/20 opacity-40 pointer-events-none"></div>
+
+        {/* Ombre du livre */}
+        <div className="absolute -right-4 bottom-0 w-[90%] h-[25px] bg-black/15 blur-md rotate-[2deg]"></div>
+      </div>
+    </div>
+  </div>
+
+  {/* 🔒 Étiquette d’aperçu verrouillée */}
+  <div className="mt-4 px-6 py-2 bg-white/80 backdrop-blur-sm border border-gray-200 rounded-full shadow-sm text-gray-700 text-sm font-medium flex items-center gap-2">
+    <span>🔒 Aperçu limité — La couverture sera 100 % personnalisable après paiement</span>
+  </div>
+</div>
+
+
+
+
+      {/* 📖 EXTRAIT */}
+<div className="relative mx-auto max-w-[650px] bg-[#fdfaf6] border border-gray-300 rounded-2xl shadow-[0_8px_30px_rgba(0,0,0,0.06)] overflow-hidden">
+  {/* léger reflet */}
+  <div className="absolute inset-0 pointer-events-none bg-gradient-to-br from-white/70 via-transparent to-gray-100/30"></div>
+
+  <div className="p-8 lg:p-10 font-serif text-[15px] leading-[1.9] text-gray-800">
+    <p className="text-[11px] tracking-[0.25em] uppercase text-gray-400 mb-3">
+      Extrait représentatif
+    </p>
+
+    {/* rendu type page de roman + lettrine en première lettre du 1er paragraphe */}
+    <div className="[&_p]:mb-4 [&_h1]:mb-4 [&_h2]:mb-3">
+      <div className="[&_p:first-child]:first-letter:text-5xl [&_p:first-child]:first-letter:font-bold [&_p:first-child]:first-letter:float-left [&_p:first-child]:first-letter:mr-3 [&_p:first-child]:first-letter:text-[#6BA5C8] [&_p:first-child]:first-letter:leading-[0.8]">
+        <ReactMarkdown>
+          {
+            // on prend 2–3 paragraphes pour un “vrai” morceau de lecture
+            previewText.split(/\n{2,}/).slice(0, 3).join("\n\n")
+          }
+        </ReactMarkdown>
+      </div>
+    </div>
+
+    <div className="mt-6 flex items-center justify-between text-[12px] text-gray-500 italic">
+      <span>
+        Style : <strong className="not-italic">{style}</strong> —{" "}
+        <strong className="not-italic">
+          {pointOfView === "first" ? "Première personne" : "Troisième personne"}
+        </strong>
+      </span>
+      <span className="text-gray-400">— Extrait —</span>
+    </div>
+  </div>
+
+  {/* ombre basse */}
+  <div className="absolute bottom-0 left-0 right-0 h-8 bg-gradient-to-t from-gray-200/60 to-transparent"></div>
+</div>
+
+    </div>
+  )}
+</Card>
+
 
       {/* Blocs */}
       <Card className="p-4 space-y-4">
@@ -385,6 +692,59 @@ export default function BuilderPage() {
           )}
         />
       </Card>
+      {/* 📘 Génération du livre final */}
+<Card className="p-6 space-y-4">
+  <h2 className="text-lg font-semibold">📘 Génération du livre final</h2>
+
+  <div className="flex flex-wrap items-center gap-3">
+    <Button
+      onClick={handleGenerateBook}
+      disabled={generatingBook}
+      className={`text-white font-semibold px-6 py-2 rounded-lg transition-all ${
+        generatingBook
+          ? "bg-gray-400 cursor-not-allowed"
+          : "bg-gradient-to-r from-[#6BA5C8] to-[#9DC8A5] hover:opacity-90"
+      }`}
+    >
+      {generatingBook ? "Rédaction en cours…" : "✨ Générer le livre complet"}
+    </Button>
+
+    <p className="text-xs text-gray-500">
+      Le livre sera rédigé à partir des souvenirs et faits bruts de tous les blocs.
+    </p>
+  </div>
+
+  {/* Zone d'affichage du livre */}
+  {generatingBook && (
+    <div className="text-center text-gray-500 py-6 animate-pulse">
+      ⏳ L’agent rédige le livre… Patiente un instant.
+    </div>
+  )}
+
+  {!generatingBook && bookText && (
+  <div className="space-y-4">
+    <div
+      id="book-content"
+      className="prose prose-indigo max-w-none border rounded-xl bg-white p-6 shadow-sm"
+    >
+      <ReactMarkdown>{bookText}</ReactMarkdown>
+    </div>
+
+    <div className="flex justify-end">
+      <button
+        onClick={handleExportPDF}
+        className="px-4 py-2 text-sm font-medium rounded-lg border hover:bg-gray-50
+                   bg-gradient-to-r from-[#6BA5C8] to-[#9DC8A5] text-white shadow-sm
+                   transition-all hover:shadow-md active:scale-95"
+      >
+        📄 Exporter en PDF
+      </button>
+    </div>
+  </div>
+)}
+
+</Card>
+
     </div>
   );
 }
