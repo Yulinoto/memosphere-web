@@ -45,3 +45,87 @@ hr {
   border-top: 1px solid var(--border);
   margin: 1rem 0;
 }
+@keyframes handwriting {
+  from {
+    width: 0;
+  }
+  to {
+    width: 100%;
+  }
+}
+
+@keyframes blink {
+  from {
+    border-color: rgba(107, 165, 200, 0.8);
+  }
+  to {
+    border-color: transparent;
+  }
+}
+.animate-handwrite {
+  display: inline-block;
+  border-right: 2px solid rgba(107, 165, 200, 0.8);
+  overflow: hidden;
+  white-space: nowrap;
+  animation: handwriting 2.2s steps(30, end) forwards,
+             blink 0.8s step-end infinite alternate;
+}
+
+
+/* html2canvas export safe overrides */
+.html2canvas-safe,
+.html2canvas-safe * {
+  color: var(--foreground) !important;
+  border-color: var(--border) !important;
+  outline-color: var(--primary) !important;
+
+  /* neutralisations visuelles */
+  background-image: none !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+  filter: none !important;
+}
+
+/* ✅ NE PAS écraser le fond des éléments marqués */
+/* Background handled by html2canvas; avoid inline highlights */
+
+/* on peut garder la règle pour cacher les UI */
+.html2canvas-safe button,
+.html2canvas-safe [data-noexport],
+.html2canvas-safe .no-export {
+  display: none !important;
+  visibility: hidden !important;
+}
+
+/* Empêche Tailwind ou le navigateur d'utiliser oklab/lch/display-p3 pour html2canvas */
+.html2canvas-safe,
+.html2canvas-safe * {
+  color-scheme: light !important;
+}
+#pdf-cover-for-export {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 720px;
+  height: 1020px;
+  z-index: -9999;
+  opacity: 0;
+  pointer-events: none;
+
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+
+  font-family: Georgia, serif;
+  font-size: 32px;
+  color: white;
+}
+
+/* ✅ Préserve les couleurs personnalisées de la couverture PDF */
+#pdf-cover-for-export,
+#pdf-cover-for-export * {
+  color: inherit !important;
+  -webkit-print-color-adjust: exact !important;
+  print-color-adjust: exact !important;
+}

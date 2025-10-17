@@ -1,117 +1,121 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
+import OpenAI from "openai";
 
-export const runtime = "nodejs";
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY!,
+});
 
-/**
- * ROUTE : /api/book/generate
- * Construit un texte biographique complet à partir des données brutes (entries + resolved),
- * pas à partir des résumés.
- */
-export async function POST(req: NextRequest) {
+export async function POST(req: Request) {
   try {
-    const body = await req.json();
-    const { blocks = [], style = "narratif", pointOfView = "first" } = body || {};
+    const payload = await req.json();
 
-    if (!blocks || typeof blocks !== "object") {
-      return NextResponse.json({ error: "Missing or invalid 'blocks' object" }, { status: 400 });
+    const {
+      bookTitle = "Titre du livre",
+      subtitle = "",
+      style = "narratif",
+      styleInstructions = "",
+      introHint = "",
+      conclusionHint = "",
+      pointOfView = "first",
+      blocks = [],
+      model = "gpt-4o-mini", // modèle par défaut
+    } = payload;
+
+    // 🔍 filtrer les blocs vides
+    const validBlocks = Array.isArray(blocks)
+      ? blocks.filter((b) => b.summary && b.summary.trim() !== "")
+      : [];
+
+    if (!validBlocks.length) {
+      return NextResponse.json(
+        { error: "Aucun bloc valide pour la génération du livre." },
+        { status: 400 }
+      );
     }
 
-    // 🧱 Étape 1 — Préparer la matière brute de chaque bloc
-    const chapters = Object.values(blocks)
-      .map((b: any) => {
-        const title = b?.title || "Chapitre sans titre";
-
-        // 🧩 Données structurées ("faits" canoniques)
-        const facts =
-          b?.resolved && typeof b.resolved === "object"
-            ? Object.entries(b.resolved)
-                .map(([k, v]: any) => `${k}: ${(v?.value ?? "").toString().trim()}`)
-                .join("\n")
-            : "Aucun fait spécifique enregistré.";
-
-        // 💬 Entrées brutes (issues des réponses d’interview)
-        const memories =
-          b?.entries && Array.isArray(b.entries)
-            ? b.entries
-                .filter((e: any) => !!(e?.a || e?.q))
-                .map((e: any) => `${e.q ? e.q + " — " : ""}${e.a}`)
-                .join("\n")
-            : "Aucun souvenir renseigné.";
-
-        return `
-### ${title}
-
-Faits connus :
-${facts}
-
-Souvenirs racontés :
-${memories}
-`;
-      })
-      .join("\n\n");
-
-    // 🧠 Étape 2 — Construire le prompt de génération
-    const styleText =
-      style === "poetique"
-        ? "avec une plume poétique, sensorielle et émotionnelle."
-        : style === "journalistique"
-        ? "avec une narration claire, factuelle et fluide."
-        : "avec un ton naturel, sincère et humain.";
-
-    const povInstruction =
-      pointOfView === "first"
-        ? "Rédige à la première personne (utilise 'je')."
-        : "Rédige à la troisième personne (utilise 'il' ou 'elle').";
-
+    // 🧠 prompt principal
     const prompt = `
-Tu es un écrivain biographique professionnel.
-Tu reçois les souvenirs bruts et les faits réels d'une personne.
-N’invente rien qui ne soit pas présent dans les données.
-Raconte ces éléments comme une histoire de vie fluide et cohérente.
-Structure ton texte en chapitres clairs avec titres.
-Rédige ${styleText}
-${povInstruction}
+Tu es un écrivain biographe professionnel et bienveillant.
+Ta mission est de rédiger un **livre complet, structuré et fluide**, à partir de données brutes issues d'une interview.
 
-Voici les données à partir desquelles écrire :
-${chapters}
-`.trim();
+🎯 Objectif :
+Produire un texte littéraire cohérent, profond et humain. Le style doit être fidèle aux paramètres ci-dessous.
 
-    // 🪄 Étape 3 — Appel au modèle
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: "Tu es un écrivain biographique professionnel et sensible.",
-          },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.7,
-      }),
+────────────────────────────
+📘 PARAMÈTRES DU LIVRE
+Titre : ${bookTitle}
+Sous-titre : ${subtitle}
+Style de rédaction : ${style}
+Point de vue : ${pointOfView === "first" ? "première personne (je)" : "troisième personne (il/elle)"}
+Instructions de style : ${styleInstructions || "aucune précision"}
+Indications d’introduction : ${introHint || "aucune"}
+Indications de conclusion : ${conclusionHint || "aucune"}
+────────────────────────────
+
+🧩 DONNÉES À UTILISER :
+Tu disposes de plusieurs blocs (chapitres) ordonnés, chacun avec un résumé :
+${validBlocks
+  .map(
+    (b, i) => `
+Chapitre ${i + 1} :
+ID : ${b.id}
+Titre proposé : ${b.title || "(à générer selon le contenu)"}
+Résumé du bloc : ${b.summary}`
+  )
+  .join("\n")}
+
+────────────────────────────
+✍️ INSTRUCTIONS DE RÉDACTION :
+1. Ne crée pas de chapitre pour les blocs vides.
+2. Respecte l’ordre exact des blocs.
+3. Rédige une introduction inspirante et engageante.
+4. Développe chaque chapitre avec détails, émotions, transitions naturelles et un ton ${style}.
+5. Utilise le ${pointOfView === "first" ? "je" : "il/elle"} constant.
+6. Conclus le livre par un message fort et humain, cohérent avec le récit.
+7. Chaque chapitre doit avoir un **titre clair**, au format markdown : "# Chapitre X — Titre".
+8. Structure le texte en paragraphes aérés.
+9. Si une information semble trop courte, enrichis-la naturellement par la narration.
+10. N’ajoute aucune note technique, ni balise, ni rappel du prompt.
+
+────────────────────────────
+💡 FORMAT DE SORTIE :
+Un texte markdown complet, contenant :
+- une introduction,
+- les chapitres (avec titres),
+- une conclusion finale.
+
+Aucune balise JSON ni explication — uniquement le texte final.
+`;
+
+    // 🧩 Appel OpenAI
+    const response = await openai.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Tu es un biographe empathique et expérimenté, spécialisé dans la rédaction de récits de vie captivants.",
+        },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.8,
+      max_tokens: 6000,
     });
 
-    const json = await res.json();
-    const bookText =
-      json?.choices?.[0]?.message?.content?.trim() || "Erreur : aucune réponse générée.";
+    const text = response.choices[0]?.message?.content?.trim();
 
-    // 🧾 Étape 4 — Réponse structurée
-    return NextResponse.json({
-      ok: true,
-      text: bookText,
-      style,
-      pointOfView,
-      tokenUsage: json?.usage ?? null,
-    });
-  } catch (e: any) {
-    console.error("BOOK GENERATION ERROR:", e);
+    if (!text) {
+      return NextResponse.json(
+        { error: "Aucun texte généré par le modèle." },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ ok: true, text });
+  } catch (error: any) {
+    console.error("❌ Erreur génération livre :", error);
     return NextResponse.json(
-      { ok: false, error: e?.message || "Erreur interne" },
+      { error: error.message || "Erreur interne du serveur." },
       { status: 500 }
     );
   }
